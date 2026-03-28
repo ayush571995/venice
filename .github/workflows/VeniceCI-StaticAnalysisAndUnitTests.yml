@@ -13,11 +13,11 @@ jobs:
      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Validate Gradle wrapper
-        uses: gradle/actions/wrapper-validation@v3
+        uses: gradle/actions/wrapper-validation@v5
 
   StaticAnalysis:
     strategy:
@@ -26,40 +26,17 @@ jobs:
         jdk: [17]
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
       contents: read
-      checks: write
-      pull-requests: write
-      issues: write
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - name: Set up JDK
-        uses: actions/setup-java@v4
+      - uses: ./.github/actions/gradle-test-setup
         with:
           java-version: ${{ matrix.jdk }}
-          distribution: 'temurin'
-          cache: 'gradle'
-      - shell: bash
-        run: |
-          git remote set-head origin --auto
-          git remote add upstream https://github.com/linkedin/venice
-          git fetch upstream
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          add-job-summary: never
       - name: Run Static Analysis
         run: ./gradlew --continue --no-daemon clean check --parallel -Pspotallbugs -x test -x integrationTest -x jacocoTestCoverageVerification -Pspotbugs.reports.all=true
-      - name: Annotate PR with SpotBugs results
-        if: failure()
-        uses: jwgmeligmeyling/spotbugs-github-action@master
-        with:
-          path: |
-            **/build/reports/spotbugs/main.xml
-            **/build/reports/spotbugs/test.xml
       - name: Package Build Artifacts
         if: success() || failure()
         shell: bash
@@ -70,7 +47,7 @@ jobs:
           tar -zcvf ${{ github.job }}-jdk${{ matrix.jdk }}-logs.tar.gz ${{ github.job }}-artifacts
       - name: Upload Build Artifacts
         if: success() || failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ github.job }}
           path: ${{ github.job }}-jdk${{ matrix.jdk }}-logs.tar.gz
@@ -142,6 +119,8 @@ jobs:
     strategy:
       fail-fast: false
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     needs: [ValidateGradleWrapper, StaticAnalysis, Clients, Integrations, Internal, Controller, Server, Router]
     timeout-minutes: 20
     if: ${{ cancelled() || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'failure') }}

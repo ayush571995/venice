@@ -1,5 +1,7 @@
 package com.linkedin.davinci.consumer;
 
+import static java.util.concurrent.TimeUnit.MINUTES;
+
 import com.linkedin.d2.balancer.D2Client;
 import com.linkedin.venice.client.store.ClientConfig;
 import com.linkedin.venice.controllerapi.D2ControllerClient;
@@ -25,7 +27,6 @@ public class ChangelogClientConfig<T extends SpecificRecord> {
 
   private SchemaReader schemaReader;
   private String viewName;
-  private Boolean isBeforeImageView = false;
 
   private String consumerName = "";
 
@@ -38,6 +39,7 @@ public class ChangelogClientConfig<T extends SpecificRecord> {
 
   private String bootstrapFileSystemPath;
   private long versionSwapDetectionIntervalTimeInSeconds = 60L;
+  private long backgroundReporterThreadSleepIntervalInSeconds = 60L;
   private int seekThreadPoolSize = 10;
 
   /**
@@ -61,7 +63,6 @@ public class ChangelogClientConfig<T extends SpecificRecord> {
 
   private Boolean isNewStatelessClientEnabled = false;
   private int maxBufferSize = 1000;
-  private boolean useRequestBasedMetadataRepository = false;
 
   /**
    * If non-null, {@link VeniceChangelogConsumer} will subscribe to a specific version of a Venice store.
@@ -81,6 +82,28 @@ public class ChangelogClientConfig<T extends SpecificRecord> {
    */
   private PubSubConsumerAdapterFactory<? extends PubSubConsumerAdapter> pubSubConsumerAdapterFactory;
   private PubSubContext pubSubContext;
+  private boolean versionSwapByControlMessageEnabled = false;
+  /**
+   * Client region name used for filtering version swap messages from other regions in A/A setup. The client will only
+   * react to version swap messages with the same source region as the client region name.
+   */
+  private String clientRegionName = "";
+  /**
+   * Total region count used for version swap in A/A setup. Each subscribed partition need to receive this many
+   * corresponding version swap messages before it can safely go to the new version to ensure data completeness.
+   */
+  private int totalRegionCount = 0;
+  /**
+   * Version swap timeout in milliseconds. If the version swap is not completed within this time, the consumer will swap
+   * to the new version and resume normal consumption from EOP for any incomplete partitions. Default is 30 minutes.
+   */
+  private long versionSwapTimeoutInMs = MINUTES.toMillis(30);
+
+  /**
+   * Whether to include control messages in buffer for users to poll. Default is false.
+   * The config is only applicable to the version specific stateless changelog consumer.
+   */
+  private boolean includeControlMessages = false;
 
   public ChangelogClientConfig(String storeName) {
     this.innerClientConfig = new ClientConfig<>(storeName);
@@ -121,7 +144,11 @@ public class ChangelogClientConfig<T extends SpecificRecord> {
   }
 
   public ChangelogClientConfig<T> setViewName(String viewName) {
-    this.viewName = viewName;
+    if (viewName != null && !viewName.isEmpty()) {
+      this.viewName = viewName;
+    } else {
+      this.viewName = null;
+    }
     return this;
   }
 
@@ -223,6 +250,21 @@ public class ChangelogClientConfig<T extends SpecificRecord> {
     return this;
   }
 
+  public long getBackgroundReporterThreadSleepIntervalInSeconds() {
+    return backgroundReporterThreadSleepIntervalInSeconds;
+  }
+
+  public ChangelogClientConfig setBackgroundReporterThreadSleepIntervalInSeconds(
+      long backgroundReporterThreadSleepIntervalInSeconds) {
+    if (backgroundReporterThreadSleepIntervalInSeconds <= 0) {
+      throw new IllegalArgumentException(
+          "backgroundReporterThreadSleepIntervalInSeconds must be positive, got: "
+              + backgroundReporterThreadSleepIntervalInSeconds);
+    }
+    this.backgroundReporterThreadSleepIntervalInSeconds = backgroundReporterThreadSleepIntervalInSeconds;
+    return this;
+  }
+
   public int getSeekThreadPoolSize() {
     return seekThreadPoolSize;
   }
@@ -284,15 +326,6 @@ public class ChangelogClientConfig<T extends SpecificRecord> {
     return this;
   }
 
-  public boolean isUseRequestBasedMetadataRepository() {
-    return useRequestBasedMetadataRepository;
-  }
-
-  public ChangelogClientConfig setUseRequestBasedMetadataRepository(boolean useRequestBasedMetadataRepository) {
-    this.useRequestBasedMetadataRepository = useRequestBasedMetadataRepository;
-    return this;
-  }
-
   public boolean shouldSkipFailedToAssembleRecords() {
     return skipFailedToAssembleRecords;
   }
@@ -327,6 +360,42 @@ public class ChangelogClientConfig<T extends SpecificRecord> {
     return this.isStateful;
   }
 
+  public boolean isVersionSwapByControlMessageEnabled() {
+    return this.versionSwapByControlMessageEnabled;
+  }
+
+  public ChangelogClientConfig setVersionSwapByControlMessageEnabled(boolean isVersionSwapByControlMessageEnabled) {
+    this.versionSwapByControlMessageEnabled = isVersionSwapByControlMessageEnabled;
+    return this;
+  }
+
+  public String getClientRegionName() {
+    return this.clientRegionName;
+  }
+
+  public ChangelogClientConfig setClientRegionName(String clientRegionName) {
+    this.clientRegionName = clientRegionName;
+    return this;
+  }
+
+  public int getTotalRegionCount() {
+    return this.totalRegionCount;
+  }
+
+  public ChangelogClientConfig setTotalRegionCount(int totalRegionCount) {
+    this.totalRegionCount = totalRegionCount;
+    return this;
+  }
+
+  public long getVersionSwapTimeoutInMs() {
+    return this.versionSwapTimeoutInMs;
+  }
+
+  public ChangelogClientConfig setVersionSwapTimeoutInMs(long versionSwapTimeoutInMs) {
+    this.versionSwapTimeoutInMs = versionSwapTimeoutInMs;
+    return this;
+  }
+
   public static <V extends SpecificRecord> ChangelogClientConfig<V> cloneConfig(ChangelogClientConfig<V> config) {
     ChangelogClientConfig<V> newConfig = new ChangelogClientConfig<V>().setStoreName(config.getStoreName())
         .setLocalD2ZkHosts(config.getLocalD2ZkHosts())
@@ -344,27 +413,22 @@ public class ChangelogClientConfig<T extends SpecificRecord> {
         .setConsumerName(config.consumerName)
         .setDatabaseSyncBytesInterval(config.getDatabaseSyncBytesInterval())
         .setShouldCompactMessages(config.shouldCompactMessages())
-        .setIsBeforeImageView(config.isBeforeImageView())
         .setIsNewStatelessClientEnabled(config.isNewStatelessClientEnabled())
         .setMaxBufferSize(config.getMaxBufferSize())
         .setSeekThreadPoolSize(config.getSeekThreadPoolSize())
         .setShouldSkipFailedToAssembleRecords(config.shouldSkipFailedToAssembleRecords())
-        .setUseRequestBasedMetadataRepository(config.isUseRequestBasedMetadataRepository())
-        .setInnerClientConfig(config.getInnerClientConfig())
+        .setIncludeControlMessages(config.shouldIncludeControlMessages())
+        .setInnerClientConfig(ClientConfig.cloneConfig(config.getInnerClientConfig()))
         // Store version should not be cloned
         .setStoreVersion(null)
         // Is stateful config should not be cloned
-        .setIsStateful(false);
+        .setIsStateful(false)
+        .setVersionSwapByControlMessageEnabled(config.isVersionSwapByControlMessageEnabled())
+        .setClientRegionName(config.getClientRegionName())
+        .setTotalRegionCount(config.getTotalRegionCount())
+        .setVersionSwapTimeoutInMs(config.getVersionSwapTimeoutInMs())
+        .setBackgroundReporterThreadSleepIntervalInSeconds(config.getBackgroundReporterThreadSleepIntervalInSeconds());
     return newConfig;
-  }
-
-  protected Boolean isBeforeImageView() {
-    return isBeforeImageView;
-  }
-
-  public ChangelogClientConfig setIsBeforeImageView(Boolean beforeImageView) {
-    isBeforeImageView = beforeImageView;
-    return this;
   }
 
   protected Boolean isNewStatelessClientEnabled() {
@@ -376,6 +440,18 @@ public class ChangelogClientConfig<T extends SpecificRecord> {
    */
   public ChangelogClientConfig setIsNewStatelessClientEnabled(Boolean newStatelessClientEnabled) {
     this.isNewStatelessClientEnabled = newStatelessClientEnabled;
+    return this;
+  }
+
+  /**
+   * Get whether to pass through control messages to the user.
+   */
+  public Boolean shouldIncludeControlMessages() {
+    return includeControlMessages;
+  }
+
+  public ChangelogClientConfig setIncludeControlMessages(Boolean includeControlMessages) {
+    this.includeControlMessages = includeControlMessages;
     return this;
   }
 

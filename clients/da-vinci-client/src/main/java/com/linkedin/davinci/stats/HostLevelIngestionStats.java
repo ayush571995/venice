@@ -46,6 +46,11 @@ public class HostLevelIngestionStats extends AbstractVeniceStats {
   // The aggregated records ingested rate for the entire host
   private final LongAdderRateGauge totalRecordsConsumedRate;
 
+  // The aggregated blob transfer sent byte rate for the entire host
+  private final LongAdderRateGauge totalBlobTransferBytesSentRate;
+  // The aggregated blob transfer received byte rate for the entire host
+  private final LongAdderRateGauge totalBlobTransferBytesReceivedRate;
+
   /*
    * Bytes read from Kafka by store ingestion task as a total. This metric includes bytes read for all store versions
    * allocated in a storage node reported with its uncompressed data size.
@@ -97,6 +102,11 @@ public class HostLevelIngestionStats extends AbstractVeniceStats {
    */
   private final Sensor writeComputeCacheHitCount;
 
+  /**
+   * Measure the total number of transient record cache lookups during UPDATE message processing.
+   */
+  private final Sensor writeComputeLookupCount;
+
   private final LongAdderRateGauge totalLeaderBytesConsumedRate;
   private final LongAdderRateGauge totalLeaderRecordsConsumedRate;
   private final LongAdderRateGauge totalFollowerBytesConsumedRate;
@@ -114,6 +124,11 @@ public class HostLevelIngestionStats extends AbstractVeniceStats {
   private final Sensor leaderIngestionReplicationMetadataCacheHitCount;
 
   /**
+   * Measure the total number of transient record cache lookups for replication metadata
+   */
+  private final Sensor leaderIngestionReplicationMetadataLookupCount;
+
+  /**
    * Measure the avg/max latency for value bytes lookup
    */
   private final Sensor leaderIngestionValueBytesLookUpLatencySensor;
@@ -122,6 +137,11 @@ public class HostLevelIngestionStats extends AbstractVeniceStats {
    * Measure the number of times value bytes were found in {@link PartitionConsumptionState#transientRecordMap}
    */
   private final Sensor leaderIngestionValueBytesCacheHitCount;
+
+  /**
+   * Measure the total number of transient record cache lookups for value bytes
+   */
+  private final Sensor leaderIngestionValueBytesLookupCount;
 
   /**
    * Measure the avg/max latency for replication metadata data lookup
@@ -171,6 +191,17 @@ public class HostLevelIngestionStats extends AbstractVeniceStats {
 
     this.totalRecordsConsumedRate =
         registerOnlyTotalRate("records_consumed", totalStats, () -> totalStats.totalRecordsConsumedRate, time);
+
+    this.totalBlobTransferBytesSentRate = registerOnlyTotalRate(
+        "blob_transfer_bytes_sent",
+        totalStats,
+        () -> totalStats.totalBlobTransferBytesSentRate,
+        time);
+    this.totalBlobTransferBytesReceivedRate = registerOnlyTotalRate(
+        "blob_transfer_bytes_received",
+        totalStats,
+        () -> totalStats.totalBlobTransferBytesReceivedRate,
+        time);
 
     this.totalBytesReadFromKafkaAsUncompressedSizeRate = registerOnlyTotalRate(
         "bytes_read_from_kafka_as_uncompressed_size",
@@ -394,6 +425,12 @@ public class HostLevelIngestionStats extends AbstractVeniceStats {
         () -> totalStats.writeComputeCacheHitCount,
         new OccurrenceRate());
 
+    this.writeComputeLookupCount = registerPerStoreAndTotalSensor(
+        "write_compute_lookup_count",
+        totalStats,
+        () -> totalStats.writeComputeLookupCount,
+        new OccurrenceRate());
+
     this.checksumVerificationFailureSensor = registerPerStoreAndTotalSensor(
         "checksum_verification_failure",
         totalStats,
@@ -412,10 +449,24 @@ public class HostLevelIngestionStats extends AbstractVeniceStats {
         () -> totalStats.leaderIngestionValueBytesCacheHitCount,
         new Rate());
 
+    // Using Rate (not OccurrenceRate) to align with existing cache hit sensor setup
+    this.leaderIngestionValueBytesLookupCount = registerPerStoreAndTotalSensor(
+        "leader_ingestion_value_bytes_lookup_count",
+        totalStats,
+        () -> totalStats.leaderIngestionValueBytesLookupCount,
+        new Rate());
+
     this.leaderIngestionReplicationMetadataCacheHitCount = registerPerStoreAndTotalSensor(
         "leader_ingestion_replication_metadata_cache_hit_count",
         totalStats,
         () -> totalStats.leaderIngestionReplicationMetadataCacheHitCount,
+        new Rate());
+
+    // Using Rate (not OccurrenceRate) to align with existing cache hit sensor setup
+    this.leaderIngestionReplicationMetadataLookupCount = registerPerStoreAndTotalSensor(
+        "leader_ingestion_replication_metadata_lookup_count",
+        totalStats,
+        () -> totalStats.leaderIngestionReplicationMetadataLookupCount,
         new Rate());
 
     this.leaderIngestionReplicationMetadataLookUpLatencySensor = registerPerStoreAndTotalSensor(
@@ -512,6 +563,26 @@ public class HostLevelIngestionStats extends AbstractVeniceStats {
     totalRecordsConsumedRate.record();
   }
 
+  /**
+   * Records the total number of bytes sent during blob transfer operations at the host level.
+   * This metric aggregates blob transfer send operations across all store versions on the host.
+   *
+   * @param bytes the number of bytes sent
+   */
+  public void recordTotalBlobTransferBytesSend(long bytes) {
+    totalBlobTransferBytesSentRate.record(bytes);
+  }
+
+  /**
+   * Records the total number of bytes received during blob transfer operations at the host level.
+   * This metric aggregates blob transfer receive operations across all store versions on the host.
+   *
+   * @param bytes the number of bytes received
+   */
+  public void recordTotalBlobTransferBytesReceived(long bytes) {
+    totalBlobTransferBytesReceivedRate.record(bytes);
+  }
+
   public void recordTotalBytesReadFromKafkaAsUncompressedSize(long bytes) {
     totalBytesReadFromKafkaAsUncompressedSizeRate.record(bytes);
   }
@@ -584,6 +655,10 @@ public class HostLevelIngestionStats extends AbstractVeniceStats {
     leaderIngestionValueBytesCacheHitCount.record(1, currentTime);
   }
 
+  public void recordIngestionValueBytesLookupCount(long currentTime) {
+    leaderIngestionValueBytesLookupCount.record(1, currentTime);
+  }
+
   public void recordIngestionReplicationMetadataLookUpLatency(double latency, long currentTimeMs) {
     leaderIngestionReplicationMetadataLookUpLatencySensor.record(latency, currentTimeMs);
   }
@@ -624,8 +699,16 @@ public class HostLevelIngestionStats extends AbstractVeniceStats {
     writeComputeCacheHitCount.record();
   }
 
+  public void recordWriteComputeLookupCount() {
+    writeComputeLookupCount.record();
+  }
+
   public void recordIngestionReplicationMetadataCacheHitCount(long currentTimeMs) {
     leaderIngestionReplicationMetadataCacheHitCount.record(1, currentTimeMs);
+  }
+
+  public void recordIngestionReplicationMetadataLookupCount(long currentTimeMs) {
+    leaderIngestionReplicationMetadataLookupCount.record(1, currentTimeMs);
   }
 
   public void recordUpdateIgnoredDCR() {

@@ -1,5 +1,7 @@
 package com.linkedin.venice.controller.kafka.consumer;
 
+import static com.linkedin.venice.controller.kafka.protocol.serializer.AdminOperationSerializer.LATEST_SCHEMA_ID_FOR_ADMIN_OPERATION;
+
 import com.linkedin.venice.common.VeniceSystemStoreType;
 import com.linkedin.venice.controller.AdminTopicMetadataAccessor;
 import com.linkedin.venice.controller.ExecutionIdAccessor;
@@ -38,6 +40,7 @@ import com.linkedin.venice.pubsub.manager.TopicManager;
 import com.linkedin.venice.utils.DaemonThreadFactory;
 import com.linkedin.venice.utils.LatencyUtils;
 import com.linkedin.venice.utils.Pair;
+import com.linkedin.venice.utils.RedundantExceptionFilter;
 import com.linkedin.venice.utils.Time;
 import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.locks.AutoCloseableLock;
@@ -63,6 +66,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -81,6 +85,9 @@ public class AdminConsumptionTask implements Runnable, Closeable {
     Exception exception;
     long executionId;
   }
+
+  private static final RedundantExceptionFilter REDUNDANT_LOGGING_FILTER =
+      RedundantExceptionFilter.getRedundantExceptionFilter();
 
   public static final int MAX_RETRIES_FOR_NONEXISTENT_STORE = 10;
 
@@ -179,6 +186,9 @@ public class AdminConsumptionTask implements Runnable, Closeable {
    * that has the details about the exception and the position of the problematic admin message.
    */
   private final ConcurrentHashMap<String, AdminErrorInfo> problematicStores;
+
+  private final ConcurrentHashMap<String, AtomicInteger> inflightThreadsByStore;
+
   private final Queue<DefaultPubSubMessage> undelegatedRecords;
 
   private final Map<String, Map<PubSubPosition, Integer>> storeRetryCountMap;
@@ -291,6 +301,7 @@ public class AdminConsumptionTask implements Runnable, Closeable {
 
     this.adminOperationsByStore = new ConcurrentHashMap<>();
     this.problematicStores = new ConcurrentHashMap<>();
+    this.inflightThreadsByStore = new ConcurrentHashMap<>();
     // since we use an unbounded queue the core pool size is really the max pool size
     this.executorService = new ThreadPoolExecutor(
         maxWorkerThreadPoolSize,
@@ -300,7 +311,6 @@ public class AdminConsumptionTask implements Runnable, Closeable {
         new LinkedBlockingQueue<>(MAX_WORKER_QUEUE_SIZE),
         new DaemonThreadFactory(String.format("Venice-Admin-Execution-Task-%s", clusterName), admin.getLogContext()));
     this.undelegatedRecords = new LinkedList<>();
-    this.stats.setAdminConsumptionFailedPosition(failingPosition);
     this.regionName = regionName;
     this.storeRetryCountMap = new ConcurrentHashMap<>();
 
@@ -424,7 +434,6 @@ public class AdminConsumptionTask implements Runnable, Closeable {
           lastUpdateTimeForConsumptionPositionLag = System.currentTimeMillis();
         }
         executeMessagesAndCollectResults();
-        stats.setAdminConsumptionFailedPosition(failingPosition);
       } catch (Exception e) {
         LOGGER.error("Exception thrown while running admin consumption task", e);
         // Unsubscribe and resubscribe in the next cycle to start over and avoid missing messages from poll.
@@ -463,7 +472,7 @@ public class AdminConsumptionTask implements Runnable, Closeable {
     consumer.subscribe(adminTopicPartition, lastDelegatedPosition, true);
     isSubscribed = true;
     LOGGER.info(
-        "Subscribed to topic name: {}, with position: {} and execution id: {}. Remote consumption flag: {}",
+        "Subscribed to admin topic: {}, with position: {} and execution id: {}. Remote consumption flag: {}",
         adminTopicPartition,
         lastDelegatedPosition,
         lastPersistedExecutionId,
@@ -559,7 +568,8 @@ public class AdminConsumptionTask implements Runnable, Closeable {
             executionIdAccessor,
             isParentController,
             stats,
-            regionName);
+            regionName,
+            inflightThreadsByStore);
         // Check if there is previously created scheduled task still occupying one thread from the pool.
         if (storesWithScheduledTask.add(storeName)) {
           // Log the store name and the position of the task being added into the task list
@@ -584,6 +594,7 @@ public class AdminConsumptionTask implements Runnable, Closeable {
         int pendingAdminMessagesCount = 0;
         int storesWithPendingAdminMessagesCount = 0;
         long adminExecutionTasksInvokeTime = System.currentTimeMillis();
+
         // Wait for the worker threads to finish processing the internal admin topics.
         List<Future<Void>> results =
             executorService.invokeAll(tasks, processingCycleTimeoutInMs, TimeUnit.MILLISECONDS);
@@ -635,10 +646,10 @@ public class AdminConsumptionTask implements Runnable, Closeable {
                 if (storeQueue != null && !storeQueue.isEmpty()) {
                   AdminOperationWrapper removedOp = storeQueue.remove();
                   LOGGER.info(
-                      "Exceeded maximum retry attempts ({}) for store {} that does not exist. Skipping admin message with offset {}.",
+                      "Exceeded maximum retry attempts ({}) for store {} that does not exist. Skipping admin message with position: {}.",
                       MAX_RETRIES_FOR_NONEXISTENT_STORE,
                       storeName,
-                      removedOp.getPosition().getNumericOffset());
+                      removedOp.getPosition());
                   retryCountMap.remove(position);
                   problematicStores.remove(storeName);
                   continue;
@@ -859,13 +870,11 @@ public class AdminConsumptionTask implements Runnable, Closeable {
             System.currentTimeMillis());
         operationQueue.add(adminOperationWrapper);
         stats.recordAdminMessageMMLatency(
-            Math.max(
-                0,
-                adminOperationWrapper.getLocalBrokerTimestamp() - adminOperationWrapper.getProducerTimestamp()));
+            Math.max(0, adminOperationWrapper.getLocalBrokerTimestamp() - adminOperationWrapper.getProducerTimestamp()),
+            adminMessageType);
         stats.recordAdminMessageDelegateLatency(
-            Math.max(
-                0,
-                adminOperationWrapper.getDelegateTimestamp() - adminOperationWrapper.getLocalBrokerTimestamp()));
+            Math.max(0, adminOperationWrapper.getDelegateTimestamp() - adminOperationWrapper.getLocalBrokerTimestamp()),
+            adminMessageType);
       }
     } else {
       long producerTimestamp = kafkaValue.producerMetadata.messageTimestamp;
@@ -878,9 +887,11 @@ public class AdminConsumptionTask implements Runnable, Closeable {
           brokerTimestamp,
           System.currentTimeMillis());
       stats.recordAdminMessageMMLatency(
-          Math.max(0, adminOperationWrapper.getLocalBrokerTimestamp() - adminOperationWrapper.getProducerTimestamp()));
+          Math.max(0, adminOperationWrapper.getLocalBrokerTimestamp() - adminOperationWrapper.getProducerTimestamp()),
+          adminMessageType);
       stats.recordAdminMessageDelegateLatency(
-          Math.max(0, adminOperationWrapper.getDelegateTimestamp() - adminOperationWrapper.getLocalBrokerTimestamp()));
+          Math.max(0, adminOperationWrapper.getDelegateTimestamp() - adminOperationWrapper.getLocalBrokerTimestamp()),
+          adminMessageType);
       String storeName = extractStoreName(adminOperation);
       adminOperationsByStore.putIfAbsent(storeName, new LinkedList<>());
       adminOperationsByStore.get(storeName).add(adminOperationWrapper);
@@ -902,7 +913,7 @@ public class AdminConsumptionTask implements Runnable, Closeable {
     if (MessageType.PUT == messageType) {
       Put put = (Put) kafkaValue.payloadUnion;
       try {
-        adminOperation = deserializer.deserialize(put.putValue, put.schemaId);
+        adminOperation = deserializeAdminOperation(put);
         executionIdFromPayload = adminOperation.executionId;
       } catch (Exception e) {
         LOGGER.error("Failed to deserialize admin operation", e);
@@ -919,6 +930,25 @@ public class AdminConsumptionTask implements Runnable, Closeable {
       executionId = resolveExecutionId(executionIdFromHeader, executionIdFromPayload, adminOperation != null);
     }
     return new Pair<>(executionId, adminOperation);
+  }
+
+  private AdminOperation deserializeAdminOperation(Put put) {
+    boolean isMessageWithFutureProtocolVersion = put.schemaId > LATEST_SCHEMA_ID_FOR_ADMIN_OPERATION;
+    if (admin.isAdminOperationSystemStoreEnabled() && isMessageWithFutureProtocolVersion) {
+      deserializer.fetchAndStoreSchemaIfAbsent(admin, put.schemaId);
+      AdminOperation adminOperation = deserializer.deserialize(put.putValue, put.schemaId);
+      stats.recordAdminMessagesWithFutureProtocolVersionCount();
+      String warningMessage = String.format(
+          "Deserialized admin operation with a newer protocol version. Schema id: %d, operation: %s",
+          put.schemaId,
+          adminOperation);
+
+      if (!REDUNDANT_LOGGING_FILTER.isRedundantException(warningMessage)) {
+        LOGGER.warn(warningMessage);
+      }
+      return adminOperation;
+    }
+    return deserializer.deserialize(put.putValue, put.schemaId);
   }
 
   private long resolveExecutionId(long fromHeader, long fromPayload, boolean payloadDeserialized) {

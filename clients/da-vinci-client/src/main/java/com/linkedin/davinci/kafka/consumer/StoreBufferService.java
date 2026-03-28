@@ -21,6 +21,7 @@ import com.linkedin.venice.pubsub.api.PubSubMessage;
 import com.linkedin.venice.pubsub.api.PubSubPosition;
 import com.linkedin.venice.pubsub.api.PubSubTopic;
 import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
+import com.linkedin.venice.stats.OpenTelemetryMetricsSetup;
 import com.linkedin.venice.utils.DaemonThreadFactory;
 import com.linkedin.venice.utils.LogContext;
 import com.linkedin.venice.utils.Utils;
@@ -84,7 +85,8 @@ public class StoreBufferService extends AbstractStoreBufferService {
       boolean queueLeaderWrites,
       LogContext logContext,
       MetricsRepository metricsRepository,
-      boolean sorted) {
+      boolean sorted,
+      String clusterName) {
     this(
         drainerNum,
         bufferCapacityPerDrainer,
@@ -93,7 +95,8 @@ public class StoreBufferService extends AbstractStoreBufferService {
         null,
         logContext,
         metricsRepository,
-        sorted);
+        sorted,
+        clusterName);
   }
 
   /**
@@ -106,7 +109,16 @@ public class StoreBufferService extends AbstractStoreBufferService {
       boolean queueLeaderWrites,
       StoreBufferServiceStats stats,
       LogContext logContext) {
-    this(drainerNum, bufferCapacityPerDrainer, bufferNotifyDelta, queueLeaderWrites, stats, logContext, null, true);
+    this(
+        drainerNum,
+        bufferCapacityPerDrainer,
+        bufferNotifyDelta,
+        queueLeaderWrites,
+        stats,
+        logContext,
+        null,
+        true,
+        null);
   }
 
   /**
@@ -124,7 +136,8 @@ public class StoreBufferService extends AbstractStoreBufferService {
       StoreBufferServiceStats stats,
       LogContext logContext,
       MetricsRepository metricsRepository,
-      boolean sorted) {
+      boolean sorted,
+      String clusterName) {
     this.logContext = logContext;
     this.drainerNum = drainerNum;
     this.blockingQueueArr = new ArrayList<>();
@@ -139,6 +152,8 @@ public class StoreBufferService extends AbstractStoreBufferService {
         : new StoreBufferServiceStats(
             Objects.requireNonNull(metricsRepository),
             sorted ? "StoreBufferServiceSorted" : "StoreBufferServiceUnsorted",
+            clusterName,
+            sorted,
             this::getTotalMemoryUsage,
             this::getTotalRemainingMemory,
             this::getMaxMemoryUsagePerDrainer,
@@ -286,16 +301,9 @@ public class StoreBufferService extends AbstractStoreBufferService {
    * @param topicPartition for which to drain buffer
    * @throws InterruptedException
    */
-  public void drainBufferedRecordsFromTopicPartition(PubSubTopicPartition topicPartition) throws InterruptedException {
-    int retryNum = 1000;
-    int sleepIntervalInMS = 50;
-    internalDrainBufferedRecordsFromTopicPartition(topicPartition, retryNum, sleepIntervalInMS);
-  }
-
-  protected void internalDrainBufferedRecordsFromTopicPartition(
-      PubSubTopicPartition topicPartition,
-      int retryNum,
-      int sleepIntervalInMS) throws InterruptedException {
+  @Override
+  public void drainBufferedRecordsFromTopicPartition(PubSubTopicPartition topicPartition, long timeoutMs)
+      throws InterruptedException {
     DefaultPubSubMessage fakeRecord = new FakePubSubMessage(topicPartition);
     int workerIndex = getDrainerIndexForConsumerRecord(fakeRecord, topicPartition.getPartitionNumber());
     BlockingQueue<QueueNode> blockingQueue = blockingQueueArr.get(workerIndex);
@@ -306,9 +314,8 @@ public class StoreBufferService extends AbstractStoreBufferService {
     }
 
     QueueNode fakeNode = new QueueNode(fakeRecord, null, "dummyKafkaUrl", 0);
-
-    int cur = 0;
-    while (cur++ < retryNum) {
+    long deadline = System.currentTimeMillis() + timeoutMs;
+    while (System.currentTimeMillis() < deadline) {
       if (!blockingQueue.contains(fakeNode)) {
         LOGGER.info(
             "The blocking queue of store writer thread: {} doesn't contain any record for: {}",
@@ -316,11 +323,10 @@ public class StoreBufferService extends AbstractStoreBufferService {
             topicPartition);
         return;
       }
-      Thread.sleep(sleepIntervalInMS);
+      Thread.sleep(50);
     }
-    String errorMessage = "There are still some records left in the blocking queue of store writer thread: "
-        + workerIndex + " for topic: " + topicPartition.getPubSubTopic().getName() + " partition after retry for "
-        + retryNum + " times";
+    String errorMessage = "Drainer queue for " + topicPartition + " on writer thread " + workerIndex
+        + " not fully drained after " + timeoutMs + "ms";
     LOGGER.error(errorMessage);
     throw new VeniceException(errorMessage);
   }
@@ -336,12 +342,19 @@ public class StoreBufferService extends AbstractStoreBufferService {
     return syncOffsetCmd.getCmdExecutedFuture();
   }
 
+  /**
+   * lastRecordPersistedFuture indicates whether the last record was persisted successfully and will have two sources.
+   * 1. From the follower code path, it is lastQueuedRecordPersistedFuture from the PCS set in putConsumeRecord().
+   * 2. From the leader side, it is the persistedToDBFuture from the LeaderProducedRecordContext from when the
+   *    LeaderProducerCallback was created.
+   */
   public void execSyncOffsetFromSnapshotAsync(
       PubSubTopicPartition topicPartition,
       PartitionTracker vtDivSnapshot,
+      CompletableFuture<Void> lastRecordPersistedFuture,
       StoreIngestionTask ingestionTask) throws InterruptedException {
     DefaultPubSubMessage fakeRecord = new FakePubSubMessage(topicPartition);
-    SyncVtDivNode syncDivNode = new SyncVtDivNode(fakeRecord, vtDivSnapshot, ingestionTask);
+    SyncVtDivNode syncDivNode = new SyncVtDivNode(fakeRecord, vtDivSnapshot, lastRecordPersistedFuture, ingestionTask);
     getDrainerForConsumerRecord(fakeRecord, topicPartition.getPartitionNumber()).put(syncDivNode);
   }
 
@@ -688,20 +701,31 @@ public class StoreBufferService extends AbstractStoreBufferService {
   /**
    * Allows the ConsumptionTask to command the Drainer to sync the VT DIV to the OffsetRecord.
    */
-  private static class SyncVtDivNode extends QueueNode {
+  static class SyncVtDivNode extends QueueNode {
     private static final int PARTIAL_CLASS_OVERHEAD = getClassOverhead(SyncVtDivNode.class);
 
-    private PartitionTracker vtDivSnapshot;
+    private final PartitionTracker vtDivSnapshot;
+    private final CompletableFuture<Void> lastRecordPersistedFuture;
 
     public SyncVtDivNode(
         DefaultPubSubMessage consumerRecord,
         PartitionTracker vtDivSnapshot,
+        CompletableFuture<Void> lastRecordPersistedFuture,
         StoreIngestionTask ingestionTask) {
       super(consumerRecord, ingestionTask, StringUtils.EMPTY, 0);
       this.vtDivSnapshot = vtDivSnapshot;
+      this.lastRecordPersistedFuture = lastRecordPersistedFuture;
     }
 
     public void execute() {
+      if (!lastRecordPersistedFuture.isDone() || lastRecordPersistedFuture.isCompletedExceptionally()) {
+        LOGGER.warn(
+            "event=globalRtDiv Skipping SyncVtDivNode for {} because preceding record failed (done={} exception={})",
+            getConsumerRecord().getTopicPartition(),
+            lastRecordPersistedFuture.isDone(),
+            lastRecordPersistedFuture.isCompletedExceptionally());
+        return;
+      }
       getIngestionTask().updateAndSyncOffsetFromSnapshot(vtDivSnapshot, getConsumerRecord().getTopicPartition());
     }
 
@@ -750,6 +774,7 @@ public class StoreBufferService extends AbstractStoreBufferService {
       LeaderProducedRecordContext leaderProducedRecordContext = null;
       StoreIngestionTask ingestionTask = null;
       CompletableFuture<Void> recordPersistedFuture = null;
+      String storeName = OpenTelemetryMetricsSetup.UNKNOWN_STORE_NAME;
       while (isRunning.get()) {
         try {
           node = blockingQueue.take();
@@ -759,6 +784,8 @@ public class StoreBufferService extends AbstractStoreBufferService {
           leaderProducedRecordContext = node.getLeaderProducedRecordContext();
           ingestionTask = node.getIngestionTask();
           recordPersistedFuture = node.getQueuedRecordPersistedFuture();
+          storeName =
+              OpenTelemetryMetricsSetup.sanitizeStoreName(ingestionTask != null ? ingestionTask.getStoreName() : null);
 
           long startTime = System.currentTimeMillis();
 
@@ -788,7 +815,7 @@ public class StoreBufferService extends AbstractStoreBufferService {
             recordPersistedFuture.complete(null);
           }
           long latencyInMS = System.currentTimeMillis() - startTime;
-          this.stats.recordInternalProcessingLatency(latencyInMS);
+          this.stats.recordInternalProcessingLatency(latencyInMS, storeName);
           topicToTimeSpent.compute(consumerRecord.getTopicPartition(), (K, V) -> (V == null ? 0 : V) + latencyInMS);
         } catch (Throwable e) {
           if (e instanceof InterruptedException) {
@@ -811,7 +838,7 @@ public class StoreBufferService extends AbstractStoreBufferService {
             logBuilder.append(consumerRecordString);
           }
           LOGGER.error(logBuilder.toString(), e);
-          stats.recordInternalProcessingError();
+          stats.recordInternalProcessingError(storeName);
 
           /**
            * Catch all the thrown exception and store it in {@link StoreIngestionTask#lastWorkerException}.
@@ -845,7 +872,7 @@ public class StoreBufferService extends AbstractStoreBufferService {
     }
   }
 
-  private static class FakePubSubMessage implements DefaultPubSubMessage {
+  static class FakePubSubMessage implements DefaultPubSubMessage {
     private static final int SHALLOW_CLASS_OVERHEAD = ClassSizeEstimator.getClassOverhead(FakePubSubMessage.class);
     private final PubSubTopicPartition topicPartition;
 

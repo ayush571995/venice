@@ -5,6 +5,7 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
@@ -17,6 +18,7 @@ import static org.mockito.Mockito.when;
 
 import com.linkedin.davinci.config.VeniceServerConfig;
 import com.linkedin.davinci.stats.StoreBufferServiceStats;
+import com.linkedin.davinci.validation.PartitionTracker;
 import com.linkedin.venice.exceptions.VeniceChecksumException;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.kafka.protocol.KafkaMessageEnvelope;
@@ -102,10 +104,10 @@ public class StoreBufferServiceTest {
     // When queueLeaderWrites is true, for leader writes, it'd be also added to the drainer queue for queueing and
     // processing
     // otherwise SIT will handle the processing directly.
-    verify(mockedStats, times(queueLeaderWrites ? 4 : 2)).recordInternalProcessingLatency(anyLong());
+    verify(mockedStats, times(queueLeaderWrites ? 4 : 2)).recordInternalProcessingLatency(anyLong(), any());
     Assert.assertThrows(
         VeniceException.class,
-        () -> bufferService.drainBufferedRecordsFromTopicPartition(pubSubTopicPartition1));
+        () -> bufferService.drainBufferedRecordsFromTopicPartition(pubSubTopicPartition1, 50000));
   }
 
   @Test(dataProviderClass = DataProviderUtils.class, dataProvider = "True-and-False")
@@ -134,7 +136,7 @@ public class StoreBufferServiceTest {
     verify(mockTask, timeout(TIMEOUT_IN_MS)).processConsumerRecord(cr2, null, partition2, kafkaUrl, 0L);
     verify(mockTask).setIngestionException(partition1, e);
     bufferService.stop();
-    verify(mockedStats).recordInternalProcessingError();
+    verify(mockedStats).recordInternalProcessingError(any());
   }
 
   @Test(dataProviderClass = DataProviderUtils.class, dataProvider = "True-and-False")
@@ -151,10 +153,8 @@ public class StoreBufferServiceTest {
     bufferService.start();
     bufferService.putConsumerRecord(cr, mockTask, null, partition, kafkaUrl, 0L);
     int nonExistingPartition = 2;
-    bufferService.internalDrainBufferedRecordsFromTopicPartition(
-        new PubSubTopicPartitionImpl(pubSubTopic, nonExistingPartition),
-        3,
-        50);
+    bufferService
+        .drainBufferedRecordsFromTopicPartition(new PubSubTopicPartitionImpl(pubSubTopic, nonExistingPartition), 150);
     bufferService.stop();
   }
 
@@ -171,7 +171,7 @@ public class StoreBufferServiceTest {
     DefaultPubSubMessage cr = new ImmutablePubSubMessage(key, value, pubSubTopicPartition1, mockPosition, 0, 0);
     bufferService.start();
     bufferService.putConsumerRecord(cr, mockTask, null, partition, kafkaUrl, 0L);
-    bufferService.internalDrainBufferedRecordsFromTopicPartition(pubSubTopicPartition1, 3, 50);
+    bufferService.drainBufferedRecordsFromTopicPartition(pubSubTopicPartition1, 150);
     bufferService.stop();
   }
 
@@ -189,7 +189,7 @@ public class StoreBufferServiceTest {
     doCallRealMethod().when(mockTask).updateOffsetMetadataAndSyncOffset(any(), any());
     bufferService.start();
     CompletableFuture<Void> cmdFuture = bufferService.execSyncOffsetCommandAsync(pubSubTopicPartition1, mockTask);
-    bufferService.drainBufferedRecordsFromTopicPartition(pubSubTopicPartition1);
+    bufferService.drainBufferedRecordsFromTopicPartition(pubSubTopicPartition1, 50000);
     cmdFuture.get(SECONDS.toMillis(30), MILLISECONDS);
     Assert.assertTrue(cmdFuture.isDone()); // Make sure the command future is done
     bufferService.stop();
@@ -212,7 +212,8 @@ public class StoreBufferServiceTest {
     doReturn(1000l).when(serverConfig).getStoreWriterBufferNotifyDelta();
     doReturn(10000l).when(serverConfig).getStoreWriterBufferMemoryCapacity();
     doReturn(queueLeaderWrites).when(serverConfig).isStoreWriterBufferAfterLeaderLogicEnabled();
-    SeparatedStoreBufferService bufferService = new SeparatedStoreBufferService(serverConfig, mockMetricRepo);
+    SeparatedStoreBufferService bufferService =
+        new SeparatedStoreBufferService(serverConfig, mockMetricRepo, "test-cluster");
     for (int partition = 0; partition < partitionCount; ++partition) {
       DefaultPubSubMessage cr = new ImmutablePubSubMessage(
           key,
@@ -305,7 +306,7 @@ public class StoreBufferServiceTest {
     String kafkaUrl = "blah";
     DefaultPubSubMessage cr1 = new ImmutablePubSubMessage(key, value, pubSubTopicPartition1, mockPosition, 0, 0);
     DefaultPubSubMessage cr2 = new ImmutablePubSubMessage(key, value, pubSubTopicPartition2, mockPosition, 0, 0);
-    Exception e = new VeniceChecksumException("test_exception");
+    Exception e = new VeniceChecksumException("test_exception", partition1);
     doThrow(e).when(mockTask).processConsumerRecord(cr1, null, partition1, kafkaUrl, 0L);
 
     bufferService.putConsumerRecord(cr1, mockTask, null, partition1, kafkaUrl, 0L);
@@ -367,12 +368,53 @@ public class StoreBufferServiceTest {
 
     bufferService.putConsumerRecord(cr3, mockTask, null, partition1, kafkaUrl, 0);
     verify(sortedSBS).putConsumerRecord(cr3, mockTask, null, partition1, kafkaUrl, 0);
-    verify(sortedSBS, never()).drainBufferedRecordsFromTopicPartition(any());
-    verify(unsortedSBS, never()).drainBufferedRecordsFromTopicPartition(any());
+    verify(sortedSBS, never()).drainBufferedRecordsFromTopicPartition(any(), anyLong());
+    verify(unsortedSBS, never()).drainBufferedRecordsFromTopicPartition(any(), anyLong());
 
     when(partitionConsumptionState.isDeferredWrite()).thenReturn(false);
     doReturn(true).when(mockTask).isHybridMode();
     bufferService.putConsumerRecord(cr4, mockTask, null, partition1, kafkaUrl, 0);
     verify(unsortedSBS).putConsumerRecord(cr4, mockTask, null, partition1, kafkaUrl, 0);
+  }
+
+  /**
+   * If the previous drainer message's future is completed exceptionally, updateAndSyncOffsetFromSnapshot() isn't called
+   */
+  @Test
+  public void testExecSyncOffsetFromSnapshotAsync() throws Exception {
+    StoreBufferService bufferService = new StoreBufferService(1, 10000, 1000, false, mockedStats, null);
+    StoreIngestionTask mockTask = mock(StoreIngestionTask.class);
+    PartitionTracker mockSnapshot = mock(PartitionTracker.class); // VT DIV Snapshot
+
+    int partition = 1;
+    String topic = Utils.getUniqueString("test_topic") + "_v1";
+    PubSubTopic pubSubTopic = pubSubTopicRepository.getTopic(topic);
+    PubSubTopicPartition topicPartition = new PubSubTopicPartitionImpl(pubSubTopic, partition);
+
+    // Mock PartitionConsumptionState with a CompletableFuture
+    CompletableFuture<Void> future = CompletableFuture.completedFuture(null);
+    when(mockTask.getPartitionConsumptionState(partition)).thenReturn(null);
+    bufferService.start();
+
+    // Case 1: PCS is null -> updateAndSyncOffsetFromSnapshot() should be called
+    bufferService.execSyncOffsetFromSnapshotAsync(topicPartition, mockSnapshot, future, mockTask);
+    verify(mockTask, timeout(TIMEOUT_IN_MS).times(1)).updateAndSyncOffsetFromSnapshot(mockSnapshot, topicPartition);
+
+    // Case 2: Future is null
+    bufferService.execSyncOffsetFromSnapshotAsync(topicPartition, mockSnapshot, future, mockTask);
+    verify(mockTask, timeout(TIMEOUT_IN_MS).times(2)).updateAndSyncOffsetFromSnapshot(mockSnapshot, topicPartition);
+
+    // Case 3: Future is completed -> updateAndSyncOffsetFromSnapshot() is safe to be called
+    bufferService.execSyncOffsetFromSnapshotAsync(topicPartition, mockSnapshot, future, mockTask);
+    verify(mockTask, timeout(TIMEOUT_IN_MS).times(3)).updateAndSyncOffsetFromSnapshot(mockSnapshot, topicPartition);
+
+    // Case 4: Previous message's future is completed exceptionally -> updateAndSyncOffsetFromSnapshot() not be called
+    clearInvocations(mockTask);
+    CompletableFuture<Void> failedFuture = new CompletableFuture<>();
+    failedFuture.completeExceptionally(new RuntimeException("Test exception"));
+    bufferService.execSyncOffsetFromSnapshotAsync(topicPartition, mockSnapshot, failedFuture, mockTask);
+    verify(mockTask, never()).updateAndSyncOffsetFromSnapshot(mockSnapshot, topicPartition);
+
+    bufferService.stop();
   }
 }

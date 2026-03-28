@@ -88,6 +88,7 @@ import com.linkedin.venice.meta.LifecycleHooksRecord;
 import com.linkedin.venice.meta.QueryAction;
 import com.linkedin.venice.meta.ServerAdminAction;
 import com.linkedin.venice.meta.StoreInfo;
+import com.linkedin.venice.meta.VeniceETLStrategy;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.meta.VersionStatus;
 import com.linkedin.venice.metadata.payload.StorePropertiesPayloadRecord;
@@ -119,6 +120,7 @@ import com.linkedin.venice.serializer.FastSerializerDeserializerFactory;
 import com.linkedin.venice.serializer.RecordDeserializer;
 import com.linkedin.venice.utils.ConfigCommonUtils;
 import com.linkedin.venice.utils.DaemonThreadFactory;
+import com.linkedin.venice.utils.LogContext;
 import com.linkedin.venice.utils.ObjectMapperFactory;
 import com.linkedin.venice.utils.RetryUtils;
 import com.linkedin.venice.utils.SslUtils;
@@ -285,6 +287,9 @@ public class AdminTool {
           for (String store: storeResponse.getStores()) {
             printStoreDescription(store);
           }
+          break;
+        case DISCOVER_CLUSTER:
+          discoverCluster(cmd);
           break;
         case JOB_STATUS:
           storeName = getRequiredArgument(cmd, Arg.STORE, Command.JOB_STATUS);
@@ -760,6 +765,17 @@ public class AdminTool {
     printObject(valueSchemas);
   }
 
+  private static void discoverCluster(CommandLine cmd) {
+    String storeName = getRequiredArgument(cmd, Arg.STORE, Command.DISCOVER_CLUSTER);
+    String veniceUrl = getRequiredArgument(cmd, Arg.URL);
+    D2ServiceDiscoveryResponse response = ControllerClient.discoverCluster(veniceUrl, storeName, sslFactory, 3);
+    if (response.isError()) {
+      printObject(response);
+    } else {
+      System.out.println(response.getCluster());
+    }
+  }
+
   private static void executeDataRecovery(CommandLine cmd) {
     String recoveryCommand = getRequiredArgument(cmd, Arg.RECOVERY_COMMAND);
     String destFabric = getRequiredArgument(cmd, Arg.DEST_FABRIC);
@@ -1021,7 +1037,11 @@ public class AdminTool {
     }
 
     // Create thread pool and start parallel processing.
-    ExecutorService executorService = Executors.newFixedThreadPool(parallelism, new DaemonThreadFactory("AdminTool"));
+    ExecutorService executorService = Executors.newFixedThreadPool(
+        parallelism,
+        new DaemonThreadFactory(
+            "AdminTool",
+            LogContext.newBuilder().setComponentName(VeniceComponent.ADMIN_TOOL.name()).build()));
     List<Future> futureList = new ArrayList<>();
     for (int i = 0; i < parallelism; i++) {
       BatchMaintenanceTaskRunner batchMaintenanceTaskRunner =
@@ -1350,6 +1370,12 @@ public class AdminTool {
     booleanParam(cmd, Arg.REGULAR_VERSION_ETL_ENABLED, p -> params.setRegularVersionETLEnabled(p), argSet);
     booleanParam(cmd, Arg.FUTURE_VERSION_ETL_ENABLED, p -> params.setFutureVersionETLEnabled(p), argSet);
     genericParam(cmd, Arg.ETLED_PROXY_USER_ACCOUNT, s -> s, p -> params.setEtledProxyUserAccount(p), argSet);
+    genericParam(
+        cmd,
+        Arg.VENICE_ETL_STRATEGY,
+        s -> VeniceETLStrategy.valueOf(s),
+        p -> params.setETLStrategy(p),
+        argSet);
     booleanParam(cmd, Arg.NATIVE_REPLICATION_ENABLED, p -> params.setNativeReplicationEnabled(p), argSet);
     genericParam(cmd, Arg.PUSH_STREAM_SOURCE_ADDRESS, s -> s, p -> params.setPushStreamSourceAddress(p), argSet);
     stringMapParam(cmd, Arg.STORE_VIEW_CONFIGS, p -> params.setStoreViews(p), argSet);
@@ -1383,6 +1409,12 @@ public class AdminTool {
         s -> s,
         p -> params.setBlobTransferInServerEnabled(ConfigCommonUtils.ActivationState.valueOf(p)),
         argSet);
+    genericParam(
+        cmd,
+        Arg.BLOB_DB_ENABLED,
+        s -> s,
+        p -> params.setBlobDbEnabled(ConfigCommonUtils.ActivationState.valueOf(p)),
+        argSet);
     booleanParam(
         cmd,
         Arg.NEARLINE_PRODUCER_COMPRESSION_ENABLED,
@@ -1399,6 +1431,8 @@ public class AdminTool {
     List<LifecycleHooksRecord> lifecycleHooksList =
         Utils.parseStoreLifecycleHooksListFromString(storeLifecycleHooksStr, Arg.STORE_LIFECYCLE_HOOKS_LIST.toString());
     params.setStoreLifecycleHooks(lifecycleHooksList);
+
+    booleanParam(cmd, Arg.FLINK_VENICE_VIEWS_ENABLED, p -> params.setFlinkVeniceViewsEnabled(p), argSet);
 
     /**
      * {@link Arg#REPLICATE_ALL_CONFIGS} doesn't require parameters; once specified, it means true.
@@ -1809,12 +1843,13 @@ public class AdminTool {
     ConsumerContext context = createConsumerContext(cmd);
     PubSubPosition startingPosition = parsePositionFromArgs(cmd, context.getPositionDeserializer(), true);
     LOGGER.info("Dump admin messages with starting position: {}", startingPosition);
-    List<DumpAdminMessages.AdminOperationInfo> adminMessages = DumpAdminMessages.dumpAdminMessages(
-        getConsumer(pubSubClientsFactory, context),
-        getRequiredArgument(cmd, Arg.CLUSTER),
-        startingPosition,
-        Integer.parseInt(getRequiredArgument(cmd, Arg.MESSAGE_COUNT)));
-    printObject(adminMessages);
+    try (PubSubConsumerAdapter consumer = getConsumer(pubSubClientsFactory, context)) {
+      DumpAdminMessages.dumpAdminMessages(
+          consumer,
+          getRequiredArgument(cmd, Arg.CLUSTER),
+          startingPosition,
+          Integer.parseInt(getRequiredArgument(cmd, Arg.MESSAGE_COUNT)));
+    }
   }
 
   private static void dumpControlMessages(CommandLine cmd, PubSubClientsFactory pubSubClientsFactory) {
@@ -3832,7 +3867,7 @@ public class AdminTool {
     // Load consumer properties and set bootstrap servers
     Properties consumerProps = loadProperties(cmd, Arg.KAFKA_CONSUMER_CONFIG_FILE);
     String pubSubBrokerUrl = getRequiredArgument(cmd, Arg.KAFKA_BOOTSTRAP_SERVERS);
-    consumerProps = DumpAdminMessages.getPubSubConsumerProperties(pubSubBrokerUrl, consumerProps);
+    PubSubUtil.addPubSubBrokerAddress(consumerProps, pubSubBrokerUrl);
 
     // Create all necessary dependencies
     VeniceProperties veniceProperties = new VeniceProperties(consumerProps);

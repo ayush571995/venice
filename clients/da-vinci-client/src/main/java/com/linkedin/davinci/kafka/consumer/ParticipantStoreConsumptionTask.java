@@ -1,5 +1,9 @@
 package com.linkedin.davinci.kafka.consumer;
 
+import static com.linkedin.venice.stats.OpenTelemetryMetricsSetup.UNKNOWN_STORE_NAME;
+import static com.linkedin.venice.stats.OpenTelemetryMetricsSetup.sanitizeStoreName;
+
+import com.google.common.annotations.VisibleForTesting;
 import com.linkedin.davinci.stats.ParticipantStoreConsumptionStats;
 import com.linkedin.venice.client.store.AvroSpecificStoreClient;
 import com.linkedin.venice.client.store.ClientConfig;
@@ -99,11 +103,14 @@ public class ParticipantStoreConsumptionTask implements Runnable, Closeable {
         this.time.sleep(participantMessageConsumptionDelayMs);
 
         for (String topic: storeIngestionService.getIngestingTopicsWithVersionStatusNotOnline()) {
+          String storeName = null;
           try {
+            String rawStoreName = Version.parseStoreFromKafkaTopicName(topic);
+            storeName = sanitizeStoreName(rawStoreName);
             ParticipantMessageKey key = new ParticipantMessageKey();
             key.messageType = ParticipantMessageType.KILL_PUSH_JOB.getValue();
             key.resourceName = topic;
-            String clusterName = clusterInfoProvider.getVeniceCluster(Version.parseStoreFromKafkaTopicName(topic));
+            String clusterName = clusterInfoProvider.getVeniceCluster(rawStoreName);
             if (clusterName == null) {
               if (LOGGER.isWarnEnabled()) {
                 String msg = "Cluster name not found for topic " + topic;
@@ -142,10 +149,11 @@ public class ParticipantStoreConsumptionTask implements Runnable, Closeable {
                 killPushJobMessage.getTimestamp(),
                 lag);
             if (storeIngestionService.killConsumptionTask(topic)) {
-              // emit metrics only when a confirmed kill is made
-              stats.recordKilledPushJobs();
-              stats.recordKillPushJobLatency(Long.max(0, lag));
+              // record success metrics: kill count and latency
+              stats.recordKilledPushJobs(storeName);
+              stats.recordKillPushJobLatency(storeName, Long.max(0, lag));
             } else {
+              stats.recordFailedKillPushJob(storeName);
               LOGGER.warn(
                   "Failed to kill Consumption for topic: {}, timestamp: {}",
                   topic,
@@ -161,7 +169,8 @@ public class ParticipantStoreConsumptionTask implements Runnable, Closeable {
             if (!EXCEPTION_FILTER.isRedundantException(msg)) {
               LOGGER.error(msg, e);
             }
-            stats.recordKillPushJobFailedConsumption();
+            // storeName is null if the exception was thrown before its assignment
+            stats.recordKillPushJobFailedConsumption(sanitizeStoreName(storeName));
           }
         }
       } catch (InterruptedException e) {
@@ -175,7 +184,7 @@ public class ParticipantStoreConsumptionTask implements Runnable, Closeable {
         if (!EXCEPTION_FILTER.isRedundantException(msg)) {
           LOGGER.error(msg, e);
         }
-        stats.recordKillPushJobFailedConsumption();
+        stats.recordKillPushJobFailedConsumption(UNKNOWN_STORE_NAME);
       } catch (Throwable t) {
         LOGGER.error("Throwable thrown while running {} thread", getClass().getSimpleName(), t);
         break;
@@ -209,5 +218,10 @@ public class ParticipantStoreConsumptionTask implements Runnable, Closeable {
     isClosing.set(true);
     clientMap.values().forEach(Utils::closeQuietlyWithErrorLogged);
     LOGGER.info("Closed {}", getClass().getSimpleName());
+  }
+
+  @VisibleForTesting
+  public ClientConfig<ParticipantMessageValue> getClientConfig() {
+    return clientConfig;
   }
 }

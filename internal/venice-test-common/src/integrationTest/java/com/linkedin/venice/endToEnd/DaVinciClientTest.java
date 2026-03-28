@@ -2,16 +2,19 @@ package com.linkedin.venice.endToEnd;
 
 import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_BLOCK_CACHE_SIZE_IN_BYTES;
 import static com.linkedin.venice.ConfigKeys.*;
+import static com.linkedin.venice.client.stats.BasicClientStats.CLIENT_METRIC_ENTITIES;
 import static com.linkedin.venice.integration.utils.DaVinciTestContext.getCachingDaVinciClientFactory;
 import static com.linkedin.venice.integration.utils.VeniceClusterWrapper.DEFAULT_KEY_SCHEMA;
 import static com.linkedin.venice.integration.utils.VeniceClusterWrapper.DEFAULT_VALUE_SCHEMA;
 import static com.linkedin.venice.meta.PersistenceType.ROCKS_DB;
+import static com.linkedin.venice.stats.ClientType.DAVINCI_CLIENT;
 import static com.linkedin.venice.utils.IntegrationTestPushUtils.createStoreForJob;
 import static com.linkedin.venice.utils.IntegrationTestPushUtils.defaultVPJProps;
 import static com.linkedin.venice.utils.TestWriteUtils.getTempDataDirectory;
 import static com.linkedin.venice.utils.TestWriteUtils.writeSimpleAvroFileWithIntToStringSchema;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_STORE_NAME_PROP;
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNull;
 import static org.testng.Assert.assertThrows;
 
@@ -24,8 +27,10 @@ import com.linkedin.davinci.client.factory.CachingDaVinciClientFactory;
 import com.linkedin.venice.D2.D2ClientUtils;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.controllerapi.ControllerClient;
+import com.linkedin.venice.controllerapi.ControllerResponse;
 import com.linkedin.venice.controllerapi.UpdateStoreQueryParams;
 import com.linkedin.venice.controllerapi.VersionCreationResponse;
+import com.linkedin.venice.exceptions.StoreDisabledException;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.helix.HelixReadOnlySchemaRepository;
 import com.linkedin.venice.integration.utils.DaVinciTestContext;
@@ -33,11 +38,13 @@ import com.linkedin.venice.integration.utils.ServiceFactory;
 import com.linkedin.venice.integration.utils.VeniceClusterCreateOptions;
 import com.linkedin.venice.integration.utils.VeniceClusterWrapper;
 import com.linkedin.venice.integration.utils.VeniceRouterWrapper;
-import com.linkedin.venice.meta.IngestionMode;
 import com.linkedin.venice.meta.StoreInfo;
+import com.linkedin.venice.partitioner.ConstantVenicePartitioner;
 import com.linkedin.venice.pubsub.PubSubProducerAdapterFactory;
 import com.linkedin.venice.serialization.VeniceKafkaSerializer;
 import com.linkedin.venice.serialization.avro.VeniceAvroKafkaSerializer;
+import com.linkedin.venice.stats.VeniceMetricsConfig;
+import com.linkedin.venice.stats.VeniceMetricsRepository;
 import com.linkedin.venice.utils.DataProviderUtils;
 import com.linkedin.venice.utils.IntegrationTestPushUtils;
 import com.linkedin.venice.utils.PropertyBuilder;
@@ -126,7 +133,6 @@ public class DaVinciClientTest {
         .put(DATA_BASE_PATH, baseDataPath)
         .put(ROCKSDB_BLOCK_CACHE_SIZE_IN_BYTES, 2 * 1024 * 1024L)
         .put(PERSISTENCE_TYPE, ROCKS_DB)
-        .put(SERVER_INGESTION_ISOLATION_D2_CLIENT_ENABLED, isD2ClientEnabled)
         .build();
 
     int totalIterations = 10;
@@ -187,6 +193,74 @@ public class DaVinciClientTest {
   }
 
   @Test(timeOut = TEST_TIMEOUT, dataProvider = "dv-client-config-provider", dataProviderClass = DataProviderUtils.class)
+  public void testDisabledReads(DaVinciConfig clientConfig) throws Exception {
+    String storeName1 = createStoreWithMetaSystemStoreAndPushStatusSystemStore(KEY_COUNT);
+    String baseDataPath = Utils.getTempDataDirectory().getAbsolutePath();
+    VeniceProperties backendConfig = new PropertyBuilder().put(CLIENT_USE_SYSTEM_STORE_REPOSITORY, true)
+        .put(CLIENT_SYSTEM_STORE_REPOSITORY_REFRESH_INTERVAL_SECONDS, 1)
+        .put(DATA_BASE_PATH, baseDataPath)
+        .put(PERSISTENCE_TYPE, ROCKS_DB)
+        .put(ROCKSDB_BLOCK_CACHE_SIZE_IN_BYTES, 2 * 1024 * 1024L)
+        .put(DA_VINCI_CURRENT_VERSION_BOOTSTRAPPING_SPEEDUP_ENABLED, true)
+        .put(PUSH_STATUS_STORE_ENABLED, true)
+        .put(DAVINCI_PUSH_STATUS_CHECK_INTERVAL_IN_MS, 1000)
+        .build();
+
+    MetricsRepository metricsRepository = new VeniceMetricsRepository(
+        new VeniceMetricsConfig.Builder().setServiceName(DAVINCI_CLIENT.getName())
+            .setMetricPrefix(DAVINCI_CLIENT.getMetricsPrefix())
+            .setEmitOtelMetrics(true)
+            .setMetricEntities(CLIENT_METRIC_ENTITIES)
+            .build());
+
+    // Test multiple clients sharing the same ClientConfig/MetricsRepository & base data path
+    try (CachingDaVinciClientFactory factory = getCachingDaVinciClientFactory(
+        d2Client,
+        VeniceRouterWrapper.CLUSTER_DISCOVERY_D2_SERVICE_NAME,
+        metricsRepository,
+        backendConfig,
+        cluster)) {
+      DaVinciClient<Integer, Object> client1 = factory.getAndStartGenericAvroClient(storeName1, clientConfig);
+
+      // Test non-existent key access
+      client1.subscribeAll().get();
+      assertNull(client1.get(KEY_COUNT + 1).get());
+
+      // client should be able to read data
+      assertEquals(client1.get(0).get(), 1);
+
+      cluster.useControllerClient(controllerClient -> {
+        ControllerResponse response = controllerClient.updateStore(
+            storeName1,
+            new UpdateStoreQueryParams().setPartitionerClass(ConstantVenicePartitioner.class.getName())
+                .setEnableReads(false));
+        assertFalse(response.isError(), response.getError());
+      });
+
+      // Wait for store update to propagate
+      TestUtils.waitForNonDeterministicAssertion(
+          1000 * backendConfig.getLong(CLIENT_SYSTEM_STORE_REPOSITORY_REFRESH_INTERVAL_SECONDS),
+          TimeUnit.SECONDS,
+          () -> {
+            assertThrows(StoreDisabledException.class, () -> client1.get(0).get());
+          });
+
+      // client should again be able to read data when reads are enabled back
+      cluster.useControllerClient(controllerClient -> {
+        ControllerResponse response = controllerClient.updateStore(
+            storeName1,
+            new UpdateStoreQueryParams().setPartitionerClass(ConstantVenicePartitioner.class.getName())
+                .setEnableReads(true));
+        assertFalse(response.isError(), response.getError());
+      });
+
+      // Wait for store update to propagate
+      Thread.sleep(1000 * backendConfig.getLong(CLIENT_SYSTEM_STORE_REPOSITORY_REFRESH_INTERVAL_SECONDS));
+      Assert.assertEquals(client1.get(0).get(), 1);
+    }
+  }
+
+  @Test(timeOut = TEST_TIMEOUT, dataProvider = "dv-client-config-provider", dataProviderClass = DataProviderUtils.class)
   public void testObjectReuse(DaVinciConfig clientConfig) throws Exception {
     final Schema schema = Schema.parse(TEST_RECORD_VALUE_SCHEMA);
     final GenericRecord value = new GenericData.Record(schema);
@@ -238,8 +312,8 @@ public class DaVinciClientTest {
     }
   }
 
-  @Test(timeOut = TEST_TIMEOUT, dataProvider = "Isolated-Ingestion", dataProviderClass = DataProviderUtils.class)
-  public void testStatusReportDuringBoostrap(IngestionMode ingestionMode, Boolean isD2ClientEnabled) throws Exception {
+  @Test(timeOut = TEST_TIMEOUT, dataProvider = "True-and-False", dataProviderClass = DataProviderUtils.class)
+  public void testStatusReportDuringBoostrap(Boolean isD2ClientEnabled) throws Exception {
     int keyCnt = 1000;
     String storeName = createStoreWithMetaSystemStoreAndPushStatusSystemStore(keyCnt);
     String baseDataPath = Utils.getTempDataDirectory().getAbsolutePath();
@@ -248,7 +322,6 @@ public class DaVinciClientTest {
     extraBackendProp.put(PUSH_STATUS_STORE_HEARTBEAT_INTERVAL_IN_SECONDS, "5");
     extraBackendProp.put(KAFKA_FETCH_QUOTA_RECORDS_PER_SECOND, "5");
     extraBackendProp.put(PUSH_STATUS_STORE_ENABLED, "true");
-    extraBackendProp.put(SERVER_INGESTION_ISOLATION_D2_CLIENT_ENABLED, isD2ClientEnabled);
     DaVinciTestContext<Integer, Object> daVinciTestContext =
         ServiceFactory.getGenericAvroDaVinciFactoryAndClientWithRetries(
             d2Client,
@@ -256,7 +329,7 @@ public class DaVinciClientTest {
             Optional.empty(),
             cluster,
             storeName,
-            new DaVinciConfig().setIsolated(ingestionMode.equals(IngestionMode.ISOLATED)),
+            new DaVinciConfig(),
             extraBackendProp);
     try (DaVinciClient<Integer, Object> client = daVinciTestContext.getDaVinciClient()) {
       CompletableFuture<Void> subscribeFuture = client.subscribeAll();

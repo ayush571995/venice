@@ -1,8 +1,10 @@
 package com.linkedin.davinci.blobtransfer.server;
 
+import com.linkedin.alpini.base.ssl.SslFactory;
 import com.linkedin.alpini.netty4.ssl.SslInitializer;
 import com.linkedin.davinci.blobtransfer.BlobSnapshotManager;
 import com.linkedin.davinci.blobtransfer.BlobTransferAclHandler;
+import com.linkedin.davinci.stats.AggBlobTransferStats;
 import com.linkedin.venice.listener.VerifySslHandler;
 import com.linkedin.venice.security.SSLFactory;
 import com.linkedin.venice.utils.SslUtils;
@@ -18,8 +20,9 @@ import java.util.Optional;
 
 
 public class BlobTransferNettyChannelInitializer extends ChannelInitializer<SocketChannel> {
-  private Optional<SSLFactory> sslFactory;
-  private Optional<BlobTransferAclHandler> aclHandler;
+  private final Optional<SSLFactory> sslFactory;
+  private final SslFactory alpiniSslFactory;
+  private final Optional<BlobTransferAclHandler> aclHandler;
 
   private final GlobalChannelTrafficShapingHandler globalChannelTrafficShapingHandler;
   private final VerifySslHandler verifySsl = new VerifySslHandler();
@@ -30,25 +33,29 @@ public class BlobTransferNettyChannelInitializer extends ChannelInitializer<Sock
       int blobTransferMaxTimeoutInMin,
       BlobSnapshotManager blobSnapshotManager,
       GlobalChannelTrafficShapingHandler globalChannelTrafficShapingHandler,
+      AggBlobTransferStats aggBlobTransferStats,
       Optional<SSLFactory> sslFactory,
       Optional<BlobTransferAclHandler> aclHandler,
       int maxAllowedConcurrentSnapshotUsers) {
     this.globalChannelTrafficShapingHandler = globalChannelTrafficShapingHandler;
     this.sslFactory = sslFactory;
+    this.alpiniSslFactory = sslFactory.isPresent() ? SslUtils.toAlpiniSSLFactory(sslFactory.get()) : null;
     this.aclHandler = aclHandler;
     this.p2pFileTransferServerHandler = new P2PFileTransferServerHandler(
         baseDir,
         blobTransferMaxTimeoutInMin,
         blobSnapshotManager,
+        aggBlobTransferStats,
         maxAllowedConcurrentSnapshotUsers);
   }
 
   @Override
   protected void initChannel(SocketChannel ch) throws Exception {
     ChannelPipeline pipeline = ch.pipeline();
-    // The sslFactory is already converted to openssl factory
-    sslFactory.ifPresent(
-        sslFactory -> ch.pipeline().addLast(new SslInitializer(SslUtils.toAlpiniSSLFactory(sslFactory), false)));
+    // The Alpini SSL factory was created in the constructor from the optional Venice SSLFactory
+    if (alpiniSslFactory != null) {
+      ch.pipeline().addLast(new SslInitializer(alpiniSslFactory, false));
+    }
 
     pipeline.addLast("globalTrafficShaper", globalChannelTrafficShapingHandler)
         .addLast("codec", new HttpServerCodec()) // for http encoding/decoding.

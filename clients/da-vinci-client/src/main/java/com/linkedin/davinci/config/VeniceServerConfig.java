@@ -11,6 +11,7 @@ import static com.linkedin.venice.ConfigKeys.BLOB_TRANSFER_CLIENT_READ_LIMIT_BYT
 import static com.linkedin.venice.ConfigKeys.BLOB_TRANSFER_DISABLED_OFFSET_LAG_THRESHOLD;
 import static com.linkedin.venice.ConfigKeys.BLOB_TRANSFER_DISABLED_TIME_LAG_THRESHOLD_IN_MINUTES;
 import static com.linkedin.venice.ConfigKeys.BLOB_TRANSFER_MANAGER_ENABLED;
+import static com.linkedin.venice.ConfigKeys.BLOB_TRANSFER_MAX_CONCURRENT_BLOB_RECEIVE_REPLICAS;
 import static com.linkedin.venice.ConfigKeys.BLOB_TRANSFER_MAX_CONCURRENT_SNAPSHOT_USER;
 import static com.linkedin.venice.ConfigKeys.BLOB_TRANSFER_MAX_TIMEOUT_IN_MIN;
 import static com.linkedin.venice.ConfigKeys.BLOB_TRANSFER_PEERS_CONNECTIVITY_FRESHNESS_IN_SECONDS;
@@ -59,6 +60,8 @@ import static com.linkedin.venice.ConfigKeys.OFFSET_LAG_CHECKPOINT_DURING_SYNC_E
 import static com.linkedin.venice.ConfigKeys.OFFSET_LAG_DELTA_RELAX_FACTOR_FOR_FAST_ONLINE_TRANSITION_IN_RESTART;
 import static com.linkedin.venice.ConfigKeys.PARTICIPANT_MESSAGE_CONSUMPTION_DELAY_MS;
 import static com.linkedin.venice.ConfigKeys.PARTICIPANT_MESSAGE_STORE_ENABLED;
+import static com.linkedin.venice.ConfigKeys.POSITIONAL_PROGRESS_LOGGING_ENABLED;
+import static com.linkedin.venice.ConfigKeys.PUBSUB_PRODUCER_TIMESTAMP_FALLBACK_ENABLED;
 import static com.linkedin.venice.ConfigKeys.PUBSUB_TOPIC_MANAGER_METADATA_FETCHER_CONSUMER_POOL_SIZE;
 import static com.linkedin.venice.ConfigKeys.PUBSUB_TOPIC_MANAGER_METADATA_FETCHER_THREAD_POOL_SIZE;
 import static com.linkedin.venice.ConfigKeys.ROUTER_PRINCIPAL_NAME;
@@ -88,6 +91,9 @@ import static com.linkedin.venice.ConfigKeys.SERVER_CONSUMER_POOL_SIZE_FOR_CURRE
 import static com.linkedin.venice.ConfigKeys.SERVER_CONSUMER_POOL_SIZE_FOR_NON_CURRENT_VERSION_AA_WC_LEADER;
 import static com.linkedin.venice.ConfigKeys.SERVER_CONSUMER_POOL_SIZE_FOR_NON_CURRENT_VERSION_NON_AA_WC_LEADER;
 import static com.linkedin.venice.ConfigKeys.SERVER_CONSUMER_POOL_SIZE_PER_KAFKA_CLUSTER;
+import static com.linkedin.venice.ConfigKeys.SERVER_CROSS_TP_PARALLEL_PROCESSING_CURRENT_VERSION_AA_WC_LEADER_ONLY;
+import static com.linkedin.venice.ConfigKeys.SERVER_CROSS_TP_PARALLEL_PROCESSING_ENABLED;
+import static com.linkedin.venice.ConfigKeys.SERVER_CROSS_TP_PARALLEL_PROCESSING_THREAD_POOL_SIZE;
 import static com.linkedin.venice.ConfigKeys.SERVER_CURRENT_VERSION_AA_WC_LEADER_QUOTA_RECORDS_PER_SECOND;
 import static com.linkedin.venice.ConfigKeys.SERVER_CURRENT_VERSION_NON_AA_WC_LEADER_QUOTA_RECORDS_PER_SECOND;
 import static com.linkedin.venice.ConfigKeys.SERVER_CURRENT_VERSION_SEPARATE_RT_LEADER_QUOTA_RECORDS_PER_SECOND;
@@ -107,6 +113,7 @@ import static com.linkedin.venice.ConfigKeys.SERVER_DISK_FULL_THRESHOLD;
 import static com.linkedin.venice.ConfigKeys.SERVER_DISK_HEALTH_CHECK_INTERVAL_IN_SECONDS;
 import static com.linkedin.venice.ConfigKeys.SERVER_DISK_HEALTH_CHECK_SERVICE_ENABLED;
 import static com.linkedin.venice.ConfigKeys.SERVER_DISK_HEALTH_CHECK_TIMEOUT_IN_SECONDS;
+import static com.linkedin.venice.ConfigKeys.SERVER_DRAIN_TIMEOUT_MS;
 import static com.linkedin.venice.ConfigKeys.SERVER_ENABLE_LIVE_CONFIG_BASED_KAFKA_THROTTLING;
 import static com.linkedin.venice.ConfigKeys.SERVER_ENABLE_PARALLEL_BATCH_GET;
 import static com.linkedin.venice.ConfigKeys.SERVER_FORKED_PROCESS_JVM_ARGUMENT_LIST;
@@ -126,15 +133,19 @@ import static com.linkedin.venice.ConfigKeys.SERVER_INCREMENTAL_PUSH_STATUS_WRIT
 import static com.linkedin.venice.ConfigKeys.SERVER_INGESTION_CHECKPOINT_DURING_GRACEFUL_SHUTDOWN_ENABLED;
 import static com.linkedin.venice.ConfigKeys.SERVER_INGESTION_HEARTBEAT_INTERVAL_MS;
 import static com.linkedin.venice.ConfigKeys.SERVER_INGESTION_INFO_LOG_LINE_LIMIT;
-import static com.linkedin.venice.ConfigKeys.SERVER_INGESTION_ISOLATION_APPLICATION_PORT;
-import static com.linkedin.venice.ConfigKeys.SERVER_INGESTION_ISOLATION_SERVICE_PORT;
-import static com.linkedin.venice.ConfigKeys.SERVER_INGESTION_MODE;
+import static com.linkedin.venice.ConfigKeys.SERVER_INGESTION_OTEL_STATS_ENABLED;
 import static com.linkedin.venice.ConfigKeys.SERVER_INGESTION_TASK_MAX_IDLE_COUNT;
 import static com.linkedin.venice.ConfigKeys.SERVER_INGESTION_TASK_REUSABLE_OBJECTS_STRATEGY;
 import static com.linkedin.venice.ConfigKeys.SERVER_KAFKA_CONSUMER_OFFSET_COLLECTION_ENABLED;
 import static com.linkedin.venice.ConfigKeys.SERVER_KAFKA_MAX_POLL_RECORDS;
+import static com.linkedin.venice.ConfigKeys.SERVER_LAG_BASED_REPLICA_AUTO_RESUBSCRIBE_ENABLED;
+import static com.linkedin.venice.ConfigKeys.SERVER_LAG_BASED_REPLICA_AUTO_RESUBSCRIBE_INTERVAL_IN_SECONDS;
+import static com.linkedin.venice.ConfigKeys.SERVER_LAG_BASED_REPLICA_AUTO_RESUBSCRIBE_MAX_REPLICA_COUNT;
+import static com.linkedin.venice.ConfigKeys.SERVER_LAG_BASED_REPLICA_AUTO_RESUBSCRIBE_THRESHOLD_IN_SECONDS;
 import static com.linkedin.venice.ConfigKeys.SERVER_LAG_MONITOR_CLEANUP_CYCLE;
 import static com.linkedin.venice.ConfigKeys.SERVER_LEADER_COMPLETE_STATE_CHECK_IN_FOLLOWER_VALID_INTERVAL_MS;
+import static com.linkedin.venice.ConfigKeys.SERVER_LEADER_HANDOVER_USE_DOL_MECHANISM_FOR_SYSTEM_STORES;
+import static com.linkedin.venice.ConfigKeys.SERVER_LEADER_HANDOVER_USE_DOL_MECHANISM_FOR_USER_STORES;
 import static com.linkedin.venice.ConfigKeys.SERVER_LEAKED_RESOURCE_CLEANUP_ENABLED;
 import static com.linkedin.venice.ConfigKeys.SERVER_LEAKED_RESOURCE_CLEAN_UP_INTERVAL_IN_MINUTES;
 import static com.linkedin.venice.ConfigKeys.SERVER_LOAD_CONTROLLER_ACCEPT_MULTIPLIER;
@@ -163,14 +174,20 @@ import static com.linkedin.venice.ConfigKeys.SERVER_OPTIMIZE_DATABASE_FOR_BACKUP
 import static com.linkedin.venice.ConfigKeys.SERVER_OPTIMIZE_DATABASE_SERVICE_SCHEDULE_INTERNAL_SECONDS;
 import static com.linkedin.venice.ConfigKeys.SERVER_PARALLEL_BATCH_GET_CHUNK_SIZE;
 import static com.linkedin.venice.ConfigKeys.SERVER_PARALLEL_RESOURCE_SHUTDOWN_ENABLED;
+import static com.linkedin.venice.ConfigKeys.SERVER_PARALLEL_SHUTDOWN_THREAD_POOL_SIZE;
 import static com.linkedin.venice.ConfigKeys.SERVER_PARTITION_GRACEFUL_DROP_DELAY_IN_SECONDS;
+import static com.linkedin.venice.ConfigKeys.SERVER_PER_RECORD_BATCH_OTEL_METRICS_ENABLED;
+import static com.linkedin.venice.ConfigKeys.SERVER_PER_RECORD_OTEL_METRICS_ENABLED;
 import static com.linkedin.venice.ConfigKeys.SERVER_PROMOTION_TO_LEADER_REPLICA_DELAY_SECONDS;
 import static com.linkedin.venice.ConfigKeys.SERVER_PUBSUB_CONSUMER_POLL_RETRY_BACKOFF_MS;
 import static com.linkedin.venice.ConfigKeys.SERVER_PUBSUB_CONSUMER_POLL_RETRY_TIMES;
 import static com.linkedin.venice.ConfigKeys.SERVER_QUOTA_ENFORCEMENT_CAPACITY_MULTIPLE;
 import static com.linkedin.venice.ConfigKeys.SERVER_QUOTA_ENFORCEMENT_ENABLED;
 import static com.linkedin.venice.ConfigKeys.SERVER_QUOTA_ENFORCEMENT_INTERVAL_IN_MILLIS;
+import static com.linkedin.venice.ConfigKeys.SERVER_READ_OTEL_STATS_ENABLED;
+import static com.linkedin.venice.ConfigKeys.SERVER_READ_QUOTA_INITIALIZATION_FALLBACK_ENABLED;
 import static com.linkedin.venice.ConfigKeys.SERVER_RECORD_LEVEL_METRICS_WHEN_BOOTSTRAPPING_CURRENT_VERSION_ENABLED;
+import static com.linkedin.venice.ConfigKeys.SERVER_RECORD_LEVEL_TIMESTAMP_ENABLED;
 import static com.linkedin.venice.ConfigKeys.SERVER_REMOTE_CONSUMER_CONFIG_PREFIX;
 import static com.linkedin.venice.ConfigKeys.SERVER_REMOTE_INGESTION_REPAIR_SLEEP_INTERVAL_SECONDS;
 import static com.linkedin.venice.ConfigKeys.SERVER_RESET_ERROR_REPLICA_ENABLED;
@@ -186,6 +203,9 @@ import static com.linkedin.venice.ConfigKeys.SERVER_SEP_RT_LEADER_QUOTA_RECORDS_
 import static com.linkedin.venice.ConfigKeys.SERVER_SHARED_CONSUMER_ASSIGNMENT_STRATEGY;
 import static com.linkedin.venice.ConfigKeys.SERVER_SHARED_CONSUMER_NON_EXISTING_TOPIC_CLEANUP_DELAY_MS;
 import static com.linkedin.venice.ConfigKeys.SERVER_SHUTDOWN_DISK_UNHEALTHY_TIME_MS;
+import static com.linkedin.venice.ConfigKeys.SERVER_SHUTDOWN_PARTITION_STATE_TIMEOUT_MS;
+import static com.linkedin.venice.ConfigKeys.SERVER_SHUTDOWN_SIT_WAIT_TIME_SECONDS;
+import static com.linkedin.venice.ConfigKeys.SERVER_SHUTDOWN_SYNC_OFFSET_TIMEOUT_MS;
 import static com.linkedin.venice.ConfigKeys.SERVER_SKIP_CHECK_AFTER_UNSUB_ENABLED;
 import static com.linkedin.venice.ConfigKeys.SERVER_SOURCE_TOPIC_OFFSET_CHECK_INTERVAL_MS;
 import static com.linkedin.venice.ConfigKeys.SERVER_SSL_HANDSHAKE_QUEUE_CAPACITY;
@@ -204,8 +224,10 @@ import static com.linkedin.venice.ConfigKeys.SERVER_THROTTLER_FACTORS_FOR_NON_CU
 import static com.linkedin.venice.ConfigKeys.SERVER_THROTTLER_FACTORS_FOR_NON_CURRENT_VERSION_NON_AA_WC_LEADER;
 import static com.linkedin.venice.ConfigKeys.SERVER_THROTTLER_FACTORS_FOR_SEP_RT_LEADER;
 import static com.linkedin.venice.ConfigKeys.SERVER_UNSUB_AFTER_BATCHPUSH;
+import static com.linkedin.venice.ConfigKeys.SERVER_USE_CHECKPOINTED_PUBSUB_POSITIONS;
 import static com.linkedin.venice.ConfigKeys.SERVER_USE_HEARTBEAT_LAG_FOR_READY_TO_SERVE_CHECK_ENABLED;
 import static com.linkedin.venice.ConfigKeys.SERVER_USE_METRICS_BASED_POSITION_IN_LAG_COMPUTATION;
+import static com.linkedin.venice.ConfigKeys.SERVER_USE_UPSTREAM_PUBSUB_POSITIONS;
 import static com.linkedin.venice.ConfigKeys.SERVER_ZSTD_DICT_COMPRESSION_LEVEL;
 import static com.linkedin.venice.ConfigKeys.SEVER_CALCULATE_QUOTA_USAGE_BASED_ON_PARTITIONS_ASSIGNMENT_ENABLED;
 import static com.linkedin.venice.ConfigKeys.SORTED_INPUT_DRAINER_SIZE;
@@ -220,6 +242,7 @@ import static com.linkedin.venice.ConfigKeys.TIME_LAG_THRESHOLD_FOR_FAST_ONLINE_
 import static com.linkedin.venice.ConfigKeys.UNREGISTER_METRIC_FOR_DELETED_STORE_ENABLED;
 import static com.linkedin.venice.ConfigKeys.UNSORTED_INPUT_DRAINER_SIZE;
 import static com.linkedin.venice.ConfigKeys.USE_DA_VINCI_SPECIFIC_EXECUTION_STATUS_FOR_ERROR;
+import static com.linkedin.venice.ConfigKeys.VENICE_LOG_CONTEXT_COMPONENT;
 import static com.linkedin.venice.pubsub.PubSubConstants.PUBSUB_TOPIC_MANAGER_METADATA_FETCHER_CONSUMER_POOL_SIZE_DEFAULT_VALUE;
 import static com.linkedin.venice.utils.ByteUtils.BYTES_PER_MB;
 import static com.linkedin.venice.utils.ByteUtils.generateHumanReadableByteCountString;
@@ -237,7 +260,6 @@ import com.linkedin.venice.acl.VeniceComponent;
 import com.linkedin.venice.authorization.DefaultIdentityParser;
 import com.linkedin.venice.exceptions.ConfigurationException;
 import com.linkedin.venice.exceptions.VeniceException;
-import com.linkedin.venice.meta.IngestionMode;
 import com.linkedin.venice.pubsub.PubSubClientsFactory;
 import com.linkedin.venice.throttle.VeniceRateLimiter;
 import com.linkedin.venice.utils.ConfigCommonUtils;
@@ -263,7 +285,7 @@ import org.apache.logging.log4j.Logger;
 
 
 /**
- * VeniceServerConfig maintains configs specific to Venice Server, Da Vinci client and Isolated Ingestion Service.
+ * VeniceServerConfig maintains configs specific to Venice Server, Da Vinci client.
  */
 public class VeniceServerConfig extends VeniceClusterConfig {
   private static final Logger LOGGER = LogManager.getLogger(VeniceServerConfig.class);
@@ -484,9 +506,6 @@ public class VeniceServerConfig extends VeniceClusterConfig {
   private final int consumerPoolSizePerKafkaCluster;
   private final boolean leakedResourceCleanupEnabled;
 
-  private final IngestionMode ingestionMode;
-  private final int ingestionServicePort;
-  private final int ingestionApplicationPort;
   private final boolean databaseChecksumVerificationEnabled;
   private final boolean rocksDbStorageEngineConfigCheckEnabled;
 
@@ -533,6 +552,10 @@ public class VeniceServerConfig extends VeniceClusterConfig {
   private final boolean enableLiveConfigBasedKafkaThrottling;
 
   private final boolean serverIngestionCheckpointDuringGracefulShutdownEnabled;
+  private final long shutdownSyncOffsetTimeoutMs;
+  private final long drainTimeoutMs;
+  private final long shutdownPartitionStateTimeoutMs;
+  private final int shutdownSitWaitTimeSeconds;
 
   private final int remoteIngestionRepairSleepInterval;
 
@@ -540,6 +563,8 @@ public class VeniceServerConfig extends VeniceClusterConfig {
   private final long optimizeDatabaseForBackupVersionNoReadThresholdMS;
   private final long optimizeDatabaseServiceScheduleIntervalSeconds;
   private final boolean unregisterMetricForDeletedStoreEnabled;
+  private final boolean ingestionOtelStatsEnabled;
+  private final boolean readOtelStatsEnabled;
   protected final boolean readOnlyForBatchOnlyStoreEnabled; // TODO: remove this config as its never used in prod
   private final boolean resetErrorReplicaEnabled;
 
@@ -581,6 +606,10 @@ public class VeniceServerConfig extends VeniceClusterConfig {
   private final boolean batchReportEOIPEnabled;
   private final IncrementalPushStatusWriteMode incrementalPushStatusWriteMode;
   private final long ingestionHeartbeatIntervalMs;
+  private final boolean producerTimestampFallbackEnabled;
+  private final boolean recordLevelTimestampEnabled;
+  private final boolean perRecordOtelMetricsEnabled;
+  private final boolean perRecordBatchOtelMetricsEnabled;
   private final long leaderCompleteStateCheckInFollowerValidIntervalMs;
   private final boolean stuckConsumerRepairEnabled;
   private final int stuckConsumerRepairIntervalSecond;
@@ -623,6 +652,7 @@ public class VeniceServerConfig extends VeniceClusterConfig {
   private final long blobTransferDisabledOffsetLagThreshold;
   private final int blobTransferDisabledTimeLagThresholdInMinutes;
   private final int snapshotCleanupIntervalInMins;
+  private final int maxConcurrentBlobReceiveReplicas;
   private final int dvcP2pBlobTransferServerPort;
   private final int dvcP2pBlobTransferClientPort;
   private final boolean daVinciCurrentVersionBootstrappingSpeedupEnabled;
@@ -641,6 +671,9 @@ public class VeniceServerConfig extends VeniceClusterConfig {
   private final int channelOptionWriteBufferHighBytes;
   private final boolean aaWCWorkloadParallelProcessingEnabled;
   private final int aaWCWorkloadParallelProcessingThreadPoolSize;
+  private final boolean crossTpParallelProcessingEnabled;
+  private final int crossTpParallelProcessingThreadPoolSize;
+  private final boolean crossTpParallelProcessingCurrentVersionAAWCLeaderOnly;
   private final boolean isGlobalRtDivEnabled;
   private final boolean nearlineWorkloadProducerThroughputOptimizationEnabled;
   private final int zstdDictCompressionLevel;
@@ -668,6 +701,10 @@ public class VeniceServerConfig extends VeniceClusterConfig {
 
   private final boolean validateSpecificSchemaEnabled;
   private final boolean useMetricsBasedPositionInLagComputation;
+  private final boolean useUpstreamPubSubPositionWithFallback;
+  private final boolean useCheckpointedPubSubPositionWithFallback;
+  private final boolean leaderHandoverUseDoLMechanismForSystemStores;
+  private final boolean leaderHandoverUseDoLMechanismForUserStores;
   private final LogContext logContext;
   private final IngestionTaskReusableObjects.Strategy ingestionTaskReusableObjectsStrategy;
   private final boolean keyUrnCompressionEnabled;
@@ -675,10 +712,19 @@ public class VeniceServerConfig extends VeniceClusterConfig {
   private final boolean inactiveTopicPartitionCheckerEnabled;
   private final int inactiveTopicPartitionCheckerInternalInSeconds;
   private final int inactiveTopicPartitionCheckerThresholdInSeconds;
+
+  private final boolean lagBasedReplicaAutoResubscribeEnabled;
+  private final int lagBasedReplicaAutoResubscribeIntervalInSeconds;
+  private final int lagBasedReplicaAutoResubscribeThresholdInSeconds;
+  private final int lagBasedReplicaAutoResubscribeMaxReplicaCount;
+
   private final int serverIngestionInfoLogLineLimit;
 
   private final boolean parallelResourceShutdownEnabled;
+  private final int parallelShutdownThreadPoolSize;
   private final int lagMonitorCleanupCycle;
+  private final boolean readQuotaInitializationFallbackEnabled;
+  private final boolean ingestionProgressLoggingEnabled;
 
   public VeniceServerConfig(VeniceProperties serverProperties) throws ConfigurationException {
     this(serverProperties, Collections.emptyMap());
@@ -689,9 +735,25 @@ public class VeniceServerConfig extends VeniceClusterConfig {
     super(serverProperties, kafkaClusterMap);
     listenerPort = serverProperties.getInt(LISTENER_PORT, 0);
     listenerHostname = serverProperties.getString(LISTENER_HOSTNAME, () -> Utils.getHostName());
-    logContext = new LogContext.Builder().setComponentName(VeniceComponent.SERVER.name())
+    String componentName = serverProperties.getString(VENICE_LOG_CONTEXT_COMPONENT, VeniceComponent.SERVER.name());
+    if (componentName != null) {
+      componentName = componentName.trim();
+    }
+    if (componentName == null || componentName.isEmpty()) {
+      componentName = VeniceComponent.SERVER.name();
+    }
+    // DaVinci clients identify themselves by hostname_pid (matching push status reporting),
+    // while servers use hostname_port (their Helix node identity).
+    String instanceName;
+    if (serverProperties.getBoolean(INGESTION_USE_DA_VINCI_CLIENT, false)) {
+      String pid = Utils.getPid();
+      instanceName = Utils.getHostName() + "_" + (pid != null ? pid : "NA");
+    } else {
+      instanceName = Utils.getHelixNodeIdentifier(listenerHostname, listenerPort);
+    }
+    logContext = new LogContext.Builder().setComponentName(componentName)
         .setRegionName(getRegionName())
-        .setInstanceName(Utils.getHelixNodeIdentifier(listenerHostname, listenerPort))
+        .setInstanceName(instanceName)
         .build();
     isGrpcEnabled = serverProperties.getBoolean(ENABLE_GRPC_READ_SERVER, false);
     grpcPort = isGrpcEnabled ? serverProperties.getInt(GRPC_READ_SERVER_PORT) : -1;
@@ -724,6 +786,7 @@ public class VeniceServerConfig extends VeniceClusterConfig {
     blobTransferServiceWriteLimitBytesPerSec =
         serverProperties.getSizeInBytes(BLOB_TRANSFER_SERVICE_WRITE_LIMIT_BYTES_PER_SEC, 157286400L);
     snapshotCleanupIntervalInMins = serverProperties.getInt(BLOB_TRANSFER_SNAPSHOT_CLEANUP_INTERVAL_IN_MINS, 120);
+    maxConcurrentBlobReceiveReplicas = serverProperties.getInt(BLOB_TRANSFER_MAX_CONCURRENT_BLOB_RECEIVE_REPLICAS, 20);
     blobTransferDisabledOffsetLagThreshold =
         serverProperties.getLong(BLOB_TRANSFER_DISABLED_OFFSET_LAG_THRESHOLD, 100000L);
     blobTransferDisabledTimeLagThresholdInMinutes =
@@ -896,10 +959,6 @@ public class VeniceServerConfig extends VeniceClusterConfig {
     }
     leakedResourceCleanupEnabled = serverProperties.getBoolean(SERVER_LEAKED_RESOURCE_CLEANUP_ENABLED, true);
 
-    ingestionMode =
-        IngestionMode.valueOf(serverProperties.getString(SERVER_INGESTION_MODE, IngestionMode.BUILT_IN.toString()));
-    ingestionServicePort = serverProperties.getInt(SERVER_INGESTION_ISOLATION_SERVICE_PORT, 27015);
-    ingestionApplicationPort = serverProperties.getInt(SERVER_INGESTION_ISOLATION_APPLICATION_PORT, 27016);
     databaseChecksumVerificationEnabled =
         serverProperties.getBoolean(SERVER_DATABASE_CHECKSUM_VERIFICATION_ENABLED, false);
 
@@ -964,6 +1023,10 @@ public class VeniceServerConfig extends VeniceClusterConfig {
      */
     serverIngestionCheckpointDuringGracefulShutdownEnabled =
         serverProperties.getBoolean(SERVER_INGESTION_CHECKPOINT_DURING_GRACEFUL_SHUTDOWN_ENABLED, true);
+    shutdownSyncOffsetTimeoutMs = serverProperties.getLong(SERVER_SHUTDOWN_SYNC_OFFSET_TIMEOUT_MS, 2000);
+    drainTimeoutMs = serverProperties.getLong(SERVER_DRAIN_TIMEOUT_MS, 2000);
+    shutdownPartitionStateTimeoutMs = serverProperties.getLong(SERVER_SHUTDOWN_PARTITION_STATE_TIMEOUT_MS, 5000);
+    shutdownSitWaitTimeSeconds = serverProperties.getInt(SERVER_SHUTDOWN_SIT_WAIT_TIME_SECONDS, 20);
     optimizeDatabaseForBackupVersionEnabled =
         serverProperties.getBoolean(SERVER_OPTIMIZE_DATABASE_FOR_BACKUP_VERSION_ENABLED, false);
     optimizeDatabaseForBackupVersionNoReadThresholdMS = serverProperties
@@ -972,6 +1035,8 @@ public class VeniceServerConfig extends VeniceClusterConfig {
         .getLong(SERVER_OPTIMIZE_DATABASE_SERVICE_SCHEDULE_INTERNAL_SECONDS, TimeUnit.MINUTES.toSeconds(1));
     unregisterMetricForDeletedStoreEnabled =
         serverProperties.getBoolean(UNREGISTER_METRIC_FOR_DELETED_STORE_ENABLED, false);
+    ingestionOtelStatsEnabled = serverProperties.getBoolean(SERVER_INGESTION_OTEL_STATS_ENABLED, true);
+    readOtelStatsEnabled = serverProperties.getBoolean(SERVER_READ_OTEL_STATS_ENABLED, true);
     fastAvroFieldLimitPerMethod = serverProperties.getInt(FAST_AVRO_FIELD_LIMIT_PER_METHOD, 100);
 
     forkedProcessJvmArgList =
@@ -988,6 +1053,10 @@ public class VeniceServerConfig extends VeniceClusterConfig {
     metaStoreWriterCloseConcurrency = serverProperties.getInt(META_STORE_WRITER_CLOSE_CONCURRENCY, -1);
     ingestionHeartbeatIntervalMs =
         serverProperties.getLong(SERVER_INGESTION_HEARTBEAT_INTERVAL_MS, TimeUnit.MINUTES.toMillis(1));
+    producerTimestampFallbackEnabled = serverProperties.getBoolean(PUBSUB_PRODUCER_TIMESTAMP_FALLBACK_ENABLED, true);
+    recordLevelTimestampEnabled = serverProperties.getBoolean(SERVER_RECORD_LEVEL_TIMESTAMP_ENABLED, false);
+    perRecordOtelMetricsEnabled = serverProperties.getBoolean(SERVER_PER_RECORD_OTEL_METRICS_ENABLED, false);
+    perRecordBatchOtelMetricsEnabled = serverProperties.getBoolean(SERVER_PER_RECORD_BATCH_OTEL_METRICS_ENABLED, false);
     batchReportEOIPEnabled =
         serverProperties.getBoolean(SERVER_BATCH_REPORT_END_OF_INCREMENTAL_PUSH_STATUS_ENABLED, false);
     incrementalPushStatusWriteMode =
@@ -1097,6 +1166,16 @@ public class VeniceServerConfig extends VeniceClusterConfig {
         serverProperties.getBoolean(SERVER_AA_WC_WORKLOAD_PARALLEL_PROCESSING_ENABLED, false);
     aaWCWorkloadParallelProcessingThreadPoolSize =
         serverProperties.getInt(SERVER_AA_WC_WORKLOAD_PARALLEL_PROCESSING_THREAD_POOL_SIZE, 8);
+    crossTpParallelProcessingEnabled = serverProperties.getBoolean(SERVER_CROSS_TP_PARALLEL_PROCESSING_ENABLED, false);
+    crossTpParallelProcessingThreadPoolSize =
+        serverProperties.getInt(SERVER_CROSS_TP_PARALLEL_PROCESSING_THREAD_POOL_SIZE, 4);
+    if (crossTpParallelProcessingEnabled && crossTpParallelProcessingThreadPoolSize < 1) {
+      throw new VeniceException(
+          "Invalid cross-TP parallel processing thread pool size: " + crossTpParallelProcessingThreadPoolSize
+              + ". Value must be at least 1.");
+    }
+    crossTpParallelProcessingCurrentVersionAAWCLeaderOnly =
+        serverProperties.getBoolean(SERVER_CROSS_TP_PARALLEL_PROCESSING_CURRENT_VERSION_AA_WC_LEADER_ONLY, false);
     nearlineWorkloadProducerThroughputOptimizationEnabled =
         serverProperties.getBoolean(SERVER_NEARLINE_WORKLOAD_PRODUCER_THROUGHPUT_OPTIMIZATION_ENABLED, true);
     zstdDictCompressionLevel =
@@ -1149,13 +1228,33 @@ public class VeniceServerConfig extends VeniceClusterConfig {
         serverProperties.getInt(SERVER_INACTIVE_TOPIC_PARTITION_CHECKER_INTERNAL_IN_SECONDS, 100);
     this.inactiveTopicPartitionCheckerThresholdInSeconds =
         serverProperties.getInt(SERVER_INACTIVE_TOPIC_PARTITION_CHECKER_THRESHOLD_IN_SECONDS, 5);
+    this.lagBasedReplicaAutoResubscribeEnabled =
+        serverProperties.getBoolean(SERVER_LAG_BASED_REPLICA_AUTO_RESUBSCRIBE_ENABLED, false);
+    this.lagBasedReplicaAutoResubscribeIntervalInSeconds =
+        serverProperties.getInt(SERVER_LAG_BASED_REPLICA_AUTO_RESUBSCRIBE_INTERVAL_IN_SECONDS, 300);
+    this.lagBasedReplicaAutoResubscribeThresholdInSeconds =
+        serverProperties.getInt(SERVER_LAG_BASED_REPLICA_AUTO_RESUBSCRIBE_THRESHOLD_IN_SECONDS, 600);
+    this.lagBasedReplicaAutoResubscribeMaxReplicaCount =
+        serverProperties.getInt(SERVER_LAG_BASED_REPLICA_AUTO_RESUBSCRIBE_MAX_REPLICA_COUNT, 3);
     this.useMetricsBasedPositionInLagComputation =
         serverProperties.getBoolean(SERVER_USE_METRICS_BASED_POSITION_IN_LAG_COMPUTATION, false);
+    this.useUpstreamPubSubPositionWithFallback =
+        serverProperties.getBoolean(SERVER_USE_UPSTREAM_PUBSUB_POSITIONS, true);
+    this.useCheckpointedPubSubPositionWithFallback =
+        serverProperties.getBoolean(SERVER_USE_CHECKPOINTED_PUBSUB_POSITIONS, true);
+    this.leaderHandoverUseDoLMechanismForSystemStores =
+        serverProperties.getBoolean(SERVER_LEADER_HANDOVER_USE_DOL_MECHANISM_FOR_SYSTEM_STORES, true);
+    this.leaderHandoverUseDoLMechanismForUserStores =
+        serverProperties.getBoolean(SERVER_LEADER_HANDOVER_USE_DOL_MECHANISM_FOR_USER_STORES, true);
     this.serverIngestionInfoLogLineLimit = serverProperties.getInt(SERVER_INGESTION_INFO_LOG_LINE_LIMIT, 20);
     this.parallelResourceShutdownEnabled =
         serverProperties.getBoolean(SERVER_PARALLEL_RESOURCE_SHUTDOWN_ENABLED, false);
+    this.parallelShutdownThreadPoolSize = serverProperties.getInt(SERVER_PARALLEL_SHUTDOWN_THREAD_POOL_SIZE, 16);
     this.lagMonitorCleanupCycle =
         serverProperties.getInt(SERVER_LAG_MONITOR_CLEANUP_CYCLE, DEFAULT_LAG_MONITOR_CLEANUP_CYCLE);
+    this.readQuotaInitializationFallbackEnabled =
+        serverProperties.getBoolean(SERVER_READ_QUOTA_INITIALIZATION_FALLBACK_ENABLED, true);
+    this.ingestionProgressLoggingEnabled = serverProperties.getBoolean(POSITIONAL_PROGRESS_LOGGING_ENABLED, false);
   }
 
   List<Double> extractThrottleLimitFactorsFor(VeniceProperties serverProperties, String configKey) {
@@ -1256,6 +1355,10 @@ public class VeniceServerConfig extends VeniceClusterConfig {
 
   public int getSnapshotCleanupIntervalInMins() {
     return snapshotCleanupIntervalInMins;
+  }
+
+  public int getMaxConcurrentBlobReceiveReplicas() {
+    return maxConcurrentBlobReceiveReplicas;
   }
 
   /**
@@ -1487,18 +1590,6 @@ public class VeniceServerConfig extends VeniceClusterConfig {
     return leakedResourceCleanupEnabled;
   }
 
-  public IngestionMode getIngestionMode() {
-    return ingestionMode;
-  }
-
-  public int getIngestionServicePort() {
-    return ingestionServicePort;
-  }
-
-  public int getIngestionApplicationPort() {
-    return ingestionApplicationPort;
-  }
-
   public boolean isDatabaseChecksumVerificationEnabled() {
     return databaseChecksumVerificationEnabled;
   }
@@ -1627,6 +1718,22 @@ public class VeniceServerConfig extends VeniceClusterConfig {
     return serverIngestionCheckpointDuringGracefulShutdownEnabled;
   }
 
+  public long getShutdownSyncOffsetTimeoutMs() {
+    return shutdownSyncOffsetTimeoutMs;
+  }
+
+  public long getDrainTimeoutMs() {
+    return drainTimeoutMs;
+  }
+
+  public long getShutdownPartitionStateTimeoutMs() {
+    return shutdownPartitionStateTimeoutMs;
+  }
+
+  public int getShutdownSitWaitTimeSeconds() {
+    return shutdownSitWaitTimeSeconds;
+  }
+
   public int getRemoteIngestionRepairSleepInterval() {
     return remoteIngestionRepairSleepInterval;
   }
@@ -1645,6 +1752,14 @@ public class VeniceServerConfig extends VeniceClusterConfig {
 
   public boolean isUnregisterMetricForDeletedStoreEnabled() {
     return unregisterMetricForDeletedStoreEnabled;
+  }
+
+  public boolean isIngestionOtelStatsEnabled() {
+    return ingestionOtelStatsEnabled;
+  }
+
+  public boolean isReadOtelStatsEnabled() {
+    return readOtelStatsEnabled;
   }
 
   public boolean isReadOnlyForBatchOnlyStoreEnabled() {
@@ -1737,6 +1852,22 @@ public class VeniceServerConfig extends VeniceClusterConfig {
 
   public long getIngestionHeartbeatIntervalMs() {
     return ingestionHeartbeatIntervalMs;
+  }
+
+  public boolean isProducerTimestampFallbackEnabled() {
+    return producerTimestampFallbackEnabled;
+  }
+
+  public boolean isRecordLevelTimestampEnabled() {
+    return recordLevelTimestampEnabled;
+  }
+
+  public boolean isPerRecordOtelMetricsEnabled() {
+    return perRecordOtelMetricsEnabled;
+  }
+
+  public boolean isPerRecordBatchOtelMetricsEnabled() {
+    return perRecordBatchOtelMetricsEnabled;
   }
 
   public boolean getBatchReportEOIPEnabled() {
@@ -1963,6 +2094,18 @@ public class VeniceServerConfig extends VeniceClusterConfig {
     return aaWCWorkloadParallelProcessingThreadPoolSize;
   }
 
+  public boolean isCrossTpParallelProcessingEnabled() {
+    return crossTpParallelProcessingEnabled;
+  }
+
+  public int getCrossTpParallelProcessingThreadPoolSize() {
+    return crossTpParallelProcessingThreadPoolSize;
+  }
+
+  public boolean isCrossTpParallelProcessingCurrentVersionAAWCLeaderOnly() {
+    return crossTpParallelProcessingCurrentVersionAAWCLeaderOnly;
+  }
+
   public boolean isGlobalRtDivEnabled() {
     return isGlobalRtDivEnabled;
   }
@@ -2075,8 +2218,40 @@ public class VeniceServerConfig extends VeniceClusterConfig {
     return inactiveTopicPartitionCheckerEnabled;
   }
 
+  public boolean isLagBasedReplicaAutoResubscribeEnabled() {
+    return lagBasedReplicaAutoResubscribeEnabled;
+  }
+
+  public int getLagBasedReplicaAutoResubscribeIntervalInSeconds() {
+    return lagBasedReplicaAutoResubscribeIntervalInSeconds;
+  }
+
+  public int getLagBasedReplicaAutoResubscribeThresholdInSeconds() {
+    return lagBasedReplicaAutoResubscribeThresholdInSeconds;
+  }
+
+  public int getLagBasedReplicaAutoResubscribeMaxReplicaCount() {
+    return lagBasedReplicaAutoResubscribeMaxReplicaCount;
+  }
+
   public boolean isUseMetricsBasedPositionInLagComputationEnabled() {
     return this.useMetricsBasedPositionInLagComputation;
+  }
+
+  public boolean isUseUpstreamPubSubPositionWithFallbackEnabled() {
+    return this.useUpstreamPubSubPositionWithFallback;
+  }
+
+  public boolean isUseCheckpointedPubSubPositionWithFallbackEnabled() {
+    return this.useCheckpointedPubSubPositionWithFallback;
+  }
+
+  public boolean isLeaderHandoverUseDoLMechanismEnabledForSystemStores() {
+    return this.leaderHandoverUseDoLMechanismForSystemStores;
+  }
+
+  public boolean isLeaderHandoverUseDoLMechanismEnabledForUserStores() {
+    return this.leaderHandoverUseDoLMechanismForUserStores;
   }
 
   public int getServerIngestionInfoLogLineLimit() {
@@ -2087,7 +2262,19 @@ public class VeniceServerConfig extends VeniceClusterConfig {
     return parallelResourceShutdownEnabled;
   }
 
+  public int getParallelShutdownThreadPoolSize() {
+    return parallelShutdownThreadPoolSize;
+  }
+
   public int getLagMonitorCleanupCycle() {
     return lagMonitorCleanupCycle;
+  }
+
+  public boolean isReadQuotaInitializationFallbackEnabled() {
+    return readQuotaInitializationFallbackEnabled;
+  }
+
+  public boolean isIngestionProgressLoggingEnabled() {
+    return ingestionProgressLoggingEnabled;
   }
 }

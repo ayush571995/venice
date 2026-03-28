@@ -20,23 +20,18 @@ import com.linkedin.davinci.config.VeniceConfigLoader;
 import com.linkedin.davinci.config.VeniceServerConfig;
 import com.linkedin.davinci.ingestion.DefaultIngestionBackend;
 import com.linkedin.davinci.ingestion.IngestionBackend;
-import com.linkedin.davinci.ingestion.IsolatedIngestionBackend;
-import com.linkedin.davinci.ingestion.main.MainIngestionStorageMetadataService;
-import com.linkedin.davinci.ingestion.utils.IsolatedIngestionUtils;
 import com.linkedin.davinci.kafka.consumer.KafkaStoreIngestionService;
-import com.linkedin.davinci.kafka.consumer.StoreIngestionService;
 import com.linkedin.davinci.notifier.VeniceNotifier;
 import com.linkedin.davinci.repository.VeniceMetadataRepositoryBuilder;
+import com.linkedin.davinci.stats.AggBlobTransferStats;
 import com.linkedin.davinci.stats.AggVersionedBlobTransferStats;
 import com.linkedin.davinci.stats.AggVersionedStorageEngineStats;
 import com.linkedin.davinci.stats.HeartbeatMonitoringServiceStats;
-import com.linkedin.davinci.stats.MetadataUpdateStats;
 import com.linkedin.davinci.stats.RocksDBMemoryStats;
 import com.linkedin.davinci.stats.ingestion.heartbeat.HeartbeatMonitoringService;
 import com.linkedin.davinci.storage.StorageEngineMetadataService;
 import com.linkedin.davinci.storage.StorageMetadataService;
 import com.linkedin.davinci.storage.StorageService;
-import com.linkedin.davinci.store.StorageEngine;
 import com.linkedin.davinci.store.cache.backend.ObjectCacheBackend;
 import com.linkedin.davinci.store.cache.backend.ObjectCacheConfig;
 import com.linkedin.venice.annotation.VisibleForTesting;
@@ -51,7 +46,6 @@ import com.linkedin.venice.exceptions.VeniceNoStoreException;
 import com.linkedin.venice.kafka.protocol.state.PartitionState;
 import com.linkedin.venice.kafka.protocol.state.StoreVersionState;
 import com.linkedin.venice.meta.ClusterInfoProvider;
-import com.linkedin.venice.meta.IngestionMode;
 import com.linkedin.venice.meta.ReadOnlySchemaRepository;
 import com.linkedin.venice.meta.ReadOnlyStoreRepository;
 import com.linkedin.venice.meta.Store;
@@ -71,6 +65,7 @@ import com.linkedin.venice.service.AbstractVeniceService;
 import com.linkedin.venice.service.ICProvider;
 import com.linkedin.venice.stats.TehutiUtils;
 import com.linkedin.venice.utils.DaemonThreadFactory;
+import com.linkedin.venice.utils.LogContext;
 import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import io.tehuti.metrics.MetricsRepository;
@@ -115,6 +110,7 @@ public class DaVinciBackend implements Closeable {
   // Per-store client tracking
   private final Map<String, ClientType> storeClientTypes = new VeniceConcurrentHashMap<>();
   private final Map<String, Integer> versionSpecificStoreVersions = new VeniceConcurrentHashMap<>();
+  private final Map<String, Integer> storeClientRefCounts = new VeniceConcurrentHashMap<>();
   private VeniceConfigLoader configLoader;
   private SubscriptionBasedReadOnlyStoreRepository storeRepository;
   private final ReadOnlySchemaRepository schemaRepository;
@@ -122,8 +118,7 @@ public class DaVinciBackend implements Closeable {
   private final RocksDBMemoryStats rocksDBMemoryStats;
   private StorageService storageService;
   private final KafkaStoreIngestionService ingestionService;
-  private final ScheduledExecutorService executor =
-      Executors.newSingleThreadScheduledExecutor(new DaemonThreadFactory("DaVinciBackend"));
+  private final ScheduledExecutorService executor;
   private final Map<String, StoreBackend> storeByNameMap = new VeniceConcurrentHashMap<>();
   private final Map<String, VersionBackend> versionByTopicMap = new VeniceConcurrentHashMap<>();
   private final StorageMetadataService storageMetadataService;
@@ -138,6 +133,7 @@ public class DaVinciBackend implements Closeable {
   private final boolean writeBatchingPushStatus;
   private final HeartbeatMonitoringService heartbeatMonitoringService;
   private AggVersionedBlobTransferStats aggVersionedBlobTransferStats;
+  private AggBlobTransferStats aggBlobTransferStats;
 
   public DaVinciBackend(
       ClientConfig clientConfig,
@@ -151,10 +147,12 @@ public class DaVinciBackend implements Closeable {
       useDaVinciSpecificExecutionStatusForError = backendConfig.useDaVinciSpecificExecutionStatusForError();
       writeBatchingPushStatus = backendConfig.getDaVinciPushStatusCheckIntervalInMs() >= 0;
       this.configLoader = configLoader;
+      this.executor = Executors.newSingleThreadScheduledExecutor(
+          new DaemonThreadFactory("DaVinciBackend", configLoader.getVeniceServerConfig().getLogContext()));
       metricsRepository = Optional.ofNullable(clientConfig.getMetricsRepository())
           .orElse(TehutiUtils.getMetricsRepository(DAVINCI_CLIENT.getName()));
       VeniceMetadataRepositoryBuilder veniceMetadataRepositoryBuilder =
-          new VeniceMetadataRepositoryBuilder(configLoader, clientConfig, metricsRepository, icProvider, false);
+          new VeniceMetadataRepositoryBuilder(configLoader, clientConfig, metricsRepository, icProvider);
 
       ClusterInfoProvider clusterInfoProvider = veniceMetadataRepositoryBuilder.getClusterInfoProvider();
       ReadOnlyStoreRepository readOnlyStoreRepository = veniceMetadataRepositoryBuilder.getStoreRepo();
@@ -190,30 +188,13 @@ public class DaVinciBackend implements Closeable {
           ? new RocksDBMemoryStats(
               metricsRepository,
               "RocksDBMemoryStats",
-              backendConfig.getRocksDBServerConfig().isRocksDBPlainTableFormatEnabled())
+              backendConfig.getRocksDBServerConfig().isRocksDBPlainTableFormatEnabled(),
+              configLoader.getVeniceClusterConfig().getClusterName())
           : null;
 
-      // Add extra safeguards here to ensure we have released RocksDB database locks before we initialize storage
-      // services.
-      IsolatedIngestionUtils.destroyLingeringIsolatedIngestionProcess(configLoader);
       /**
        * The constructor of {@link #storageService} will take care of unused store/store version cleanup.
-       *
-       * When Ingestion Isolation is enabled, we don't want to restore data partitions here:
-       * 1. It is a waste of effort since all the opened partitioned will be closed right after.
-       * 2. When DaVinci memory limiter is enabled, currently, SSTFileManager doesn't clean up the entries belonging
-       *    to the closed database, which means when the Isolated process hands the database back to the main process,
-       *    some removed SST files (some SST files can be removed in Isolated Process because of log compaction) will
-       *    remain in SSTFileManager tracked file list.
-       * 3. We still want to open metadata partition, otherwise {@link StorageService} won't scan the local db folder.
-       *    Also opening metadata partition in main process won't cause much side effect from DaVinci memory limiter's
-       *    POV, since metadata partition won't be handed back to main process in the future.
-       * 4. When Ingestion Isolation is enabled with suppressing live update feature, main process needs to open all the
-       *    data partitions since Isolated Process won't re-ingest the existing partitions.
        */
-      boolean whetherToRestoreDataPartitions = !isIsolatedIngestion()
-          || configLoader.getVeniceServerConfig().freezeIngestionIfReadyToServeOrLocalDataExists();
-      LOGGER.info("DaVinci {} restore data partitions.", whetherToRestoreDataPartitions ? "will" : "won't");
       storageService = new StorageService(
           configLoader,
           aggVersionedStorageEngineStats,
@@ -221,7 +202,7 @@ public class DaVinciBackend implements Closeable {
           storeVersionStateSerializer,
           partitionStateSerializer,
           storeRepository,
-          whetherToRestoreDataPartitions,
+          true,
           true,
           functionToCheckWhetherStorageEngineShouldBeKeptOrNot(managedClients));
       storageService.start();
@@ -243,14 +224,8 @@ public class DaVinciBackend implements Closeable {
         LOGGER.info("Successfully verified the latest protocols at runtime are valid in Venice backend.");
       }
 
-      storageMetadataService = backendConfig.getIngestionMode().equals(IngestionMode.ISOLATED)
-          ? new MainIngestionStorageMetadataService(
-              backendConfig.getIngestionServicePort(),
-              partitionStateSerializer,
-              new MetadataUpdateStats(metricsRepository),
-              configLoader,
-              storageService.getStoreVersionStateSyncer())
-          : new StorageEngineMetadataService(storageService.getStorageEngineRepository(), partitionStateSerializer);
+      storageMetadataService =
+          new StorageEngineMetadataService(storageService.getStorageEngineRepository(), partitionStateSerializer);
       // Start storage metadata service
       ((AbstractVeniceService) storageMetadataService).start();
       compressorFactory = new StorageEngineBackedCompressorFactory(storageMetadataService);
@@ -258,8 +233,10 @@ public class DaVinciBackend implements Closeable {
       cacheBackend = cacheConfig
           .map(objectCacheConfig -> new ObjectCacheBackend(clientConfig, objectCacheConfig, schemaRepository));
 
-      HeartbeatMonitoringServiceStats heartbeatMonitoringServiceStats =
-          new HeartbeatMonitoringServiceStats(metricsRepository, "da-vinci");
+      HeartbeatMonitoringServiceStats heartbeatMonitoringServiceStats = new HeartbeatMonitoringServiceStats(
+          metricsRepository,
+          "da-vinci",
+          configLoader.getVeniceClusterConfig().getClusterName());
       heartbeatMonitoringService = new HeartbeatMonitoringService(
           metricsRepository,
           readOnlyStoreRepository,
@@ -280,7 +257,6 @@ public class DaVinciBackend implements Closeable {
           partitionStateSerializer,
           Optional.empty(),
           null,
-          false,
           compressorFactory,
           cacheBackend,
           true,
@@ -313,20 +289,11 @@ public class DaVinciBackend implements Closeable {
 
       ingestionService.start();
 
-      if (isIsolatedIngestion() && cacheConfig.isPresent()) {
-        // TODO: There are 'some' cases where this mix might be ok, (like a batch only store, or with certain TTL
-        // settings),
-        // could add further validation. If the process isn't ingesting data, then it can't maintain the object cache
-        // with
-        // a correct view of the data.
-        throw new IllegalArgumentException(
-            "Ingestion isolated and Cache are incompatible configs!!  Aborting start up!");
-      }
-
-      if (BlobTransferUtils.isBlobTransferManagerEnabled(backendConfig, isIsolatedIngestion())) {
+      if (BlobTransferUtils.isBlobTransferManagerEnabled(backendConfig)) {
         aggVersionedBlobTransferStats =
             new AggVersionedBlobTransferStats(metricsRepository, storeRepository, configLoader.getVeniceServerConfig());
-
+        aggBlobTransferStats =
+            new AggBlobTransferStats(aggVersionedBlobTransferStats, ingestionService.getHostLevelIngestionStats());
         P2PBlobTransferConfig p2PBlobTransferConfig = new P2PBlobTransferConfig(
             configLoader.getVeniceServerConfig().getDvcP2pBlobTransferServerPort(),
             configLoader.getVeniceServerConfig().getDvcP2pBlobTransferClientPort(),
@@ -342,21 +309,29 @@ public class DaVinciBackend implements Closeable {
             backendConfig.getBlobTransferPeersConnectivityFreshnessInSeconds(),
             backendConfig.getBlobTransferClientReadLimitBytesPerSec(),
             backendConfig.getBlobTransferServiceWriteLimitBytesPerSec(),
-            backendConfig.getSnapshotCleanupIntervalInMins());
+            backendConfig.getSnapshotCleanupIntervalInMins(),
+            backendConfig.getMaxConcurrentBlobReceiveReplicas());
 
         blobTransferManager = new BlobTransferManagerBuilder().setBlobTransferConfig(p2PBlobTransferConfig)
             .setClientConfig(clientConfig)
             .setStorageMetadataService(storageMetadataService)
             .setReadOnlyStoreRepository(readOnlyStoreRepository)
             .setStorageEngineRepository(storageService.getStorageEngineRepository())
-            .setAggVersionedBlobTransferStats(aggVersionedBlobTransferStats)
+            .setAggBlobTransferStats(aggBlobTransferStats)
             .setBlobTransferSSLFactory(BlobTransferUtils.createSSLFactoryForBlobTransferInDVC(configLoader))
             .setBlobTransferAclHandler(BlobTransferUtils.createAclHandler(configLoader))
             .setPushStatusNotifierSupplier(() -> ingestionListener)
+            .setLogContext(backendConfig.getLogContext())
             .build();
       } else {
         aggVersionedBlobTransferStats = null;
+        aggBlobTransferStats = null;
         blobTransferManager = null;
+      }
+
+      // Inject blob transfer manager into ingestion service so SIT can use it
+      if (blobTransferManager != null) {
+        ingestionService.setBlobTransferManager(blobTransferManager);
       }
 
       bootstrap();
@@ -436,41 +411,11 @@ public class DaVinciBackend implements Closeable {
 
   @VisibleForTesting
   final synchronized void bootstrap() {
-    /**
-     * In order to make bootstrap logic compatible with ingestion isolation, we first scan all local storage engines,
-     * record all store versions that are up-to-date and close all storage engines. This will make sure child process
-     * can open RocksDB stores.
-     */
-    if (isIsolatedIngestion()) {
-      if (configLoader.getVeniceServerConfig().freezeIngestionIfReadyToServeOrLocalDataExists()) {
-        /**
-         * In this case we will only need to close metadata partition, as it is supposed to be opened and managed by
-         * forked ingestion process via following subscribe call.
-         */
-        for (StorageEngine storageEngine: getStorageService().getStorageEngineRepository()
-            .getAllLocalStorageEngines()) {
-          storageEngine.closeMetadataPartition();
-        }
-      } else {
-        getStorageService().closeAllStorageEngines();
-      }
-    }
-
-    ingestionBackend = isIsolatedIngestion()
-        ? new IsolatedIngestionBackend(
-            configLoader,
-            metricsRepository,
-            storageMetadataService,
-            ingestionService,
-            getStorageService(),
-            blobTransferManager,
-            this::getVeniceCurrentVersionNumber)
-        : new DefaultIngestionBackend(
-            storageMetadataService,
-            ingestionService,
-            getStorageService(),
-            blobTransferManager,
-            configLoader.getVeniceServerConfig());
+    ingestionBackend = new DefaultIngestionBackend(
+        storageMetadataService,
+        ingestionService,
+        getStorageService(),
+        configLoader.getVeniceServerConfig());
     ingestionBackend.addIngestionNotifier(ingestionListener);
   }
 
@@ -481,8 +426,10 @@ public class DaVinciBackend implements Closeable {
     cacheBackend.ifPresent(
         objectCacheBackend -> storeRepository
             .unregisterStoreDataChangedListener(objectCacheBackend.getCacheInvalidatingStoreChangeListener()));
-    ExecutorService storeBackendCloseExecutor =
-        Executors.newCachedThreadPool(new DaemonThreadFactory("DaVinciBackend-StoreBackend-Close"));
+    ExecutorService storeBackendCloseExecutor = Executors.newCachedThreadPool(
+        new DaemonThreadFactory(
+            "DaVinciBackend-StoreBackend-Close",
+            configLoader.getVeniceServerConfig().getLogContext()));
     for (StoreBackend storeBackend: storeByNameMap.values()) {
       /**
        * {@link StoreBackend#close()} is time-consuming since the internal {@link VersionBackend#close()} call triggers
@@ -571,7 +518,7 @@ public class DaVinciBackend implements Closeable {
     return storageService;
   }
 
-  final StoreIngestionService getIngestionService() {
+  final KafkaStoreIngestionService getIngestionService() {
     return ingestionService;
   }
 
@@ -629,10 +576,6 @@ public class DaVinciBackend implements Closeable {
     if (storeBackend != null) {
       storeBackend.delete();
     }
-  }
-
-  public final boolean isIsolatedIngestion() {
-    return configLoader.getVeniceServerConfig().getIngestionMode().equals(IngestionMode.ISOLATED);
   }
 
   // Move the logic to this protected method to make it visible for unit test.
@@ -740,17 +683,56 @@ public class DaVinciBackend implements Closeable {
       }
     }
 
+    // Increment ref count for this store
+    storeClientRefCounts.merge(storeName, 1, Integer::sum);
+
     if (isVersionSpecific) {
       versionSpecificStoreVersions.put(storeName, storeVersion);
     }
 
     storeClientTypes.put(storeName, newClientType);
+
+    // Disable blob transfer for version-specific or stateless clients
+    if (isVersionSpecific || isStatelessRecordTransformer(storeName)) {
+      ingestionService.registerBlobTransferDisabled(storeName);
+    }
+  }
+
+  private boolean isStatelessRecordTransformer(String storeName) {
+    InternalDaVinciRecordTransformerConfig config = ingestionService.getInternalRecordTransformerConfig(storeName);
+    return config != null && !config.getRecordTransformerConfig().getStoreRecordsInDaVinci();
   }
 
   public synchronized void unregisterStoreClient(String storeName, Integer storeVersion) {
-    storeClientTypes.remove(storeName);
-    if (storeVersion != null) {
-      versionSpecificStoreVersions.remove(storeName);
+    LOGGER.info("Unregistering store client: {} version: {}", storeName, storeVersion);
+
+    // Decrement ref count for this store
+    Integer currentCount = storeClientRefCounts.get(storeName);
+    if (currentCount == null) {
+      LOGGER.warn("Attempting to unregister store client for '{}' but no registration found", storeName);
+      return;
+    }
+
+    int newCount = currentCount - 1;
+
+    // Only remove tracking when the last client unregisters
+    if (newCount <= 0) {
+      storeClientRefCounts.remove(storeName);
+      storeClientTypes.remove(storeName);
+      ingestionService.unregisterBlobTransferDisabled(storeName);
+      ingestionService.unregisterRecordTransformerConfig(storeName);
+      if (storeVersion != null) {
+        versionSpecificStoreVersions.remove(storeName);
+      }
+
+      StoreBackend storeBackend = storeByNameMap.get(storeName);
+      if (storeBackend != null) {
+        // Stop ingestion tasks for this store without deleting store data
+        LOGGER.info("Closing StoreBackend for store: {}", storeName);
+        storeBackend.close();
+      }
+    } else {
+      storeClientRefCounts.put(storeName, newCount);
     }
   }
 
@@ -762,6 +744,11 @@ public class DaVinciBackend implements Closeable {
   @VisibleForTesting
   public Integer getVersionSpecificStoreVersion(String storeName) {
     return versionSpecificStoreVersions.get(storeName);
+  }
+
+  @VisibleForTesting
+  public Integer getStoreClientRefCount(String storeName) {
+    return storeClientRefCounts.get(storeName);
   }
 
   @VisibleForTesting
@@ -919,11 +906,14 @@ public class DaVinciBackend implements Closeable {
   }
 
   static class BootstrappingAwareCompletableFuture {
-    private ScheduledExecutorService scheduledExecutor =
-        Executors.newSingleThreadScheduledExecutor(new DaemonThreadFactory("DaVinci_Bootstrapping_Check_Executor"));
+    private ScheduledExecutorService scheduledExecutor;
     public final CompletableFuture<Void> bootstrappingFuture = new CompletableFuture<>();
 
     public BootstrappingAwareCompletableFuture(DaVinciBackend backend) {
+      LogContext logContext =
+          backend.configLoader != null ? backend.configLoader.getVeniceServerConfig().getLogContext() : null;
+      this.scheduledExecutor = Executors.newSingleThreadScheduledExecutor(
+          new DaemonThreadFactory("DaVinci_Bootstrapping_Check_Executor", logContext));
       scheduledExecutor.scheduleAtFixedRate(() -> {
         if (bootstrappingFuture.isDone()) {
           return;

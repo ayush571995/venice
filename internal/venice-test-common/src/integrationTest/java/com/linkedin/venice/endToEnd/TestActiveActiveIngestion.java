@@ -2,11 +2,7 @@ package com.linkedin.venice.endToEnd;
 
 import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_LEVEL0_COMPACTION_TUNING_FOR_READ_WRITE_LEADER_ENABLED;
 import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED;
-import static com.linkedin.venice.ConfigKeys.CHILD_DATA_CENTER_KAFKA_URL_PREFIX;
-import static com.linkedin.venice.ConfigKeys.DEFAULT_MAX_NUMBER_OF_PARTITIONS;
-import static com.linkedin.venice.ConfigKeys.SERVER_AA_WC_WORKLOAD_PARALLEL_PROCESSING_ENABLED;
-import static com.linkedin.venice.ConfigKeys.SERVER_CONSUMER_POOL_ALLOCATION_STRATEGY;
-import static com.linkedin.venice.ConfigKeys.SERVER_DEDICATED_DRAINER_FOR_SORTED_INPUT_ENABLED;
+import static com.linkedin.venice.ConfigKeys.*;
 import static com.linkedin.venice.integration.utils.VeniceClusterWrapperConstants.DEFAULT_PARENT_DATA_CENTER_REGION_NAME;
 import static com.linkedin.venice.utils.IntegrationTestPushUtils.createStoreForJob;
 import static com.linkedin.venice.utils.IntegrationTestPushUtils.sendStreamingDeleteRecord;
@@ -17,7 +13,6 @@ import static com.linkedin.venice.utils.TestWriteUtils.getTempDataDirectory;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.DATA_WRITER_COMPUTE_JOB_CLASS;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.DEFAULT_KEY_FIELD_PROP;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.DEFAULT_VALUE_FIELD_PROP;
-import static com.linkedin.venice.vpj.VenicePushJobConstants.KAFKA_INPUT_BROKER_URL;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.KAFKA_INPUT_MAX_RECORDS_PER_MAPPER;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.PUBSUB_INPUT_SECONDARY_COMPARATOR_USE_LOCAL_LOGICAL_INDEX;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.REPUSH_TTL_ENABLE;
@@ -26,6 +21,7 @@ import static com.linkedin.venice.vpj.VenicePushJobConstants.RMD_FIELD_PROP;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.SOURCE_KAFKA;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.SPARK_NATIVE_INPUT_FORMAT_ENABLED;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.TARGETED_REGION_PUSH_ENABLED;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_REPUSH_SOURCE_PUBSUB_BROKER;
 
 import com.linkedin.davinci.kafka.consumer.KafkaConsumerServiceDelegator;
 import com.linkedin.venice.annotation.PubSubAgnosticTest;
@@ -103,11 +99,11 @@ public class TestActiveActiveIngestion {
     return false;
   }
 
-  protected boolean isAAWCParallelProcessingEnabled() {
+  protected boolean whetherToEnableNearlineProducerThroughputOptimizationInServer() {
     return false;
   }
 
-  protected boolean whetherToEnableNearlineProducerThroughputOptimizationInServer() {
+  protected boolean isCrossTpParallelProcessingEnabled() {
     return false;
   }
 
@@ -126,7 +122,8 @@ public class TestActiveActiveIngestion {
     serverProperties.put(
         SERVER_CONSUMER_POOL_ALLOCATION_STRATEGY,
         KafkaConsumerServiceDelegator.ConsumerPoolStrategyType.CURRENT_VERSION_PRIORITIZATION.name());
-    serverProperties.put(SERVER_AA_WC_WORKLOAD_PARALLEL_PROCESSING_ENABLED, isAAWCParallelProcessingEnabled());
+    serverProperties.put(SERVER_USE_HEARTBEAT_LAG_FOR_READY_TO_SERVE_CHECK_ENABLED, false);
+    serverProperties.put(SERVER_CROSS_TP_PARALLEL_PROCESSING_ENABLED, isCrossTpParallelProcessingEnabled());
     Properties controllerProps = new Properties();
     controllerProps.put(DEFAULT_MAX_NUMBER_OF_PARTITIONS, 20);
     VeniceMultiRegionClusterCreateOptions.Builder optionsBuilder =
@@ -376,7 +373,7 @@ public class TestActiveActiveIngestion {
 
     // run repush with targeted region push
     props.setProperty(SOURCE_KAFKA, "true");
-    props.setProperty(KAFKA_INPUT_BROKER_URL, clusterWrapper.getPubSubBrokerWrapper().getAddress());
+    props.setProperty(VENICE_REPUSH_SOURCE_PUBSUB_BROKER, clusterWrapper.getPubSubBrokerWrapper().getAddress());
     props.setProperty(KAFKA_INPUT_MAX_RECORDS_PER_MAPPER, "5");
     props.setProperty(PUBSUB_INPUT_SECONDARY_COMPARATOR_USE_LOCAL_LOGICAL_INDEX, "true");
     props.setProperty(TARGETED_REGION_PUSH_ENABLED, "true");

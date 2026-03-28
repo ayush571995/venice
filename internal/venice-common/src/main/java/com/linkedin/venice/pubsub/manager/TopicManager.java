@@ -25,8 +25,6 @@ import com.linkedin.venice.pubsub.PubSubConstants;
 import com.linkedin.venice.pubsub.PubSubTopicConfiguration;
 import com.linkedin.venice.pubsub.PubSubTopicPartitionInfo;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
-import com.linkedin.venice.pubsub.PubSubUtil;
-import com.linkedin.venice.pubsub.adapter.kafka.common.ApacheKafkaOffsetPosition;
 import com.linkedin.venice.pubsub.api.PubSubAdminAdapter;
 import com.linkedin.venice.pubsub.api.PubSubConsumerAdapter;
 import com.linkedin.venice.pubsub.api.PubSubPosition;
@@ -150,6 +148,26 @@ public class TopicManager implements Closeable {
       boolean logCompaction,
       Optional<Integer> minIsr,
       boolean useFastPubSubOperationTimeout) {
+    createTopic(
+        topicName,
+        numPartitions,
+        replication,
+        eternal,
+        logCompaction,
+        minIsr,
+        useFastPubSubOperationTimeout,
+        false);
+  }
+
+  public void createTopic(
+      PubSubTopic topicName,
+      int numPartitions,
+      int replication,
+      boolean eternal,
+      boolean logCompaction,
+      Optional<Integer> minIsr,
+      boolean useFastPubSubOperationTimeout,
+      boolean useAlternativeBackend) {
     long retentionTimeMs;
     if (eternal) {
       retentionTimeMs = ETERNAL_TOPIC_RETENTION_POLICY_MS;
@@ -163,7 +181,8 @@ public class TopicManager implements Closeable {
         retentionTimeMs,
         logCompaction,
         minIsr,
-        useFastPubSubOperationTimeout);
+        useFastPubSubOperationTimeout,
+        useAlternativeBackend);
   }
 
   /**
@@ -188,6 +207,51 @@ public class TopicManager implements Closeable {
       boolean logCompaction,
       Optional<Integer> minIsr,
       boolean useFastPubSubOperationTimeout) {
+    createTopic(
+        topicName,
+        numPartitions,
+        replication,
+        retentionTimeMs,
+        logCompaction,
+        minIsr,
+        useFastPubSubOperationTimeout,
+        false);
+  }
+
+  /**
+   * @param useAlternativeBackend if true, signals that the topic should be created using an alternative PubSub backend
+   */
+  public void createTopic(
+      PubSubTopic topicName,
+      int numPartitions,
+      int replication,
+      long retentionTimeMs,
+      boolean logCompaction,
+      Optional<Integer> minIsr,
+      boolean useFastPubSubOperationTimeout,
+      boolean useAlternativeBackend) {
+    createTopic(
+        topicName,
+        numPartitions,
+        replication,
+        retentionTimeMs,
+        logCompaction,
+        minIsr,
+        useFastPubSubOperationTimeout,
+        useAlternativeBackend,
+        Optional.empty());
+  }
+
+  public void createTopic(
+      PubSubTopic topicName,
+      int numPartitions,
+      int replication,
+      long retentionTimeMs,
+      boolean logCompaction,
+      Optional<Integer> minIsr,
+      boolean useFastPubSubOperationTimeout,
+      boolean useAlternativeBackend,
+      Optional<Boolean> uncleanLeaderElectionEnable) {
     long startTimeMs = System.currentTimeMillis();
     long deadlineMs = startTimeMs + (useFastPubSubOperationTimeout
         ? PUBSUB_FAST_OPERATION_TIMEOUT_MS
@@ -197,7 +261,9 @@ public class TopicManager implements Closeable {
         logCompaction,
         minIsr,
         topicManagerContext.getTopicMinLogCompactionLagMs(),
-        Optional.empty());
+        Optional.empty(),
+        useAlternativeBackend,
+        uncleanLeaderElectionEnable);
     logger.info(
         "Creating topic: {} partitions: {} replication: {}, configuration: {}",
         topicName,
@@ -742,16 +808,16 @@ public class TopicManager implements Closeable {
   public Map<PubSubTopicPartition, PubSubPosition> getEndPositionsForTopicWithRetries(PubSubTopic pubSubTopic) {
     return RetryUtils.executeWithMaxAttempt(
         () -> topicMetadataFetcher.getEndPositionsForTopic(pubSubTopic),
-        10,
-        Duration.ofMinutes(1),
+        5,
+        Duration.ofMinutes(3),
         Collections.singletonList(Exception.class));
   }
 
   public Map<PubSubTopicPartition, PubSubPosition> getStartPositionsForTopicWithRetries(PubSubTopic pubSubTopic) {
     return RetryUtils.executeWithMaxAttempt(
         () -> topicMetadataFetcher.getStartPositionsForTopic(pubSubTopic),
-        10,
-        Duration.ofMinutes(1),
+        5,
+        Duration.ofMinutes(3),
         Collections.singletonList(Exception.class));
   }
 
@@ -807,6 +873,9 @@ public class TopicManager implements Closeable {
    * In typical usage, {@code endPosition} is "last + 1", so the range is
    * {@code [startPosition, endPosition)}.
    *
+   * <p>If {@code startPosition} is {@link PubSubSymbolicPosition#EARLIEST}, this method will use
+   * the cached earliest position to optimize performance.
+   *
    * @param pubSubTopicPartition the topic-partition
    * @param endPosition the upper bound of the range
    * @param startPosition the lower bound of the range
@@ -822,7 +891,36 @@ public class TopicManager implements Closeable {
     Objects.requireNonNull(endPosition, "endPosition");
     Objects.requireNonNull(startPosition, "startPosition");
 
-    return topicMetadataFetcher.diffPosition(pubSubTopicPartition, endPosition, startPosition);
+    // Use cached earliest position when startPosition is EARLIEST to optimize performance.
+    // If it still resolves to EARLIEST, let diffPosition handle it.
+    PubSubPosition resolvedStartPosition = startPosition;
+    if (startPosition == PubSubSymbolicPosition.EARLIEST) {
+      resolvedStartPosition = topicMetadataFetcher.getEarliestPositionCached(pubSubTopicPartition);
+    }
+
+    return topicMetadataFetcher.diffPosition(pubSubTopicPartition, endPosition, resolvedStartPosition);
+  }
+
+  /**
+   * Indicates ingestion progress by returning the percentage of records in the given topic-partition
+   * up to the specified position.
+   * @param position the position up to which records are counted
+   * @return the percentage of records up to the specified position (0-100)
+   */
+  public int getIngestionProgressPercentage(PubSubTopicPartition topicPartition, PubSubPosition position) {
+    int percentage = 0;
+    try {
+      final long totalRecords = getNumRecordsInPartition(topicPartition);
+      if (totalRecords <= 0) {
+        return 0; // sanity check to avoid divide-by-zero
+      }
+      final long recordsUntilPosition = countRecordsUntil(topicPartition, position);
+      percentage = (int) ((recordsUntilPosition * 100) / totalRecords);
+    } catch (Exception e) {
+      // this log message is best-effort. there is no point in throwing an exception for the sake of this.
+      logger.warn("Swallowed an exception when trying to determine progress for {}", topicPartition, e);
+    }
+    return percentage;
   }
 
   /**
@@ -957,11 +1055,8 @@ public class TopicManager implements Closeable {
 
   /**
    * Advances a position within a {@link PubSubTopicPartition} by a specified number of records.
-   *
-   * <p>Currently, this method always returns an {@link ApacheKafkaOffsetPosition} constructed
-   * by incrementing the numeric offset in {@code startInclusive} by {@code n}. In the future,
-   * this will be replaced with a call to the underlying {@code PubSubClient} so that each
-   * implementation can return its own {@link PubSubPosition} type.
+   * Delegates to the underlying {@code PubSubConsumerAdapter} so that each implementation
+   * returns its own {@link PubSubPosition} type.
    *
    * @param tp the topic partition in which the position is being advanced; must not be {@code null}
    * @param startInclusive the starting position (inclusive) from which advancement begins; must not be {@code null}
@@ -971,22 +1066,7 @@ public class TopicManager implements Closeable {
    * @throws NullPointerException if {@code tp} or {@code startInclusive} is {@code null}
    */
   public PubSubPosition advancePosition(PubSubTopicPartition tp, PubSubPosition startInclusive, long n) {
-
-    Objects.requireNonNull(tp, "tp");
-    Objects.requireNonNull(startInclusive, "startInclusive");
-    if (n < 0) {
-      throw new IllegalArgumentException("n must be >= 0");
-    }
-
-    // Get the numeric offset from the start position.
-    // If your getter is named differently, swap it in here.
-    long startOffset = startInclusive.getNumericOffset();
-
-    // Exclusive end = start + n. Use addExact to catch overflow.
-    long targetOffset = Math.addExact(startOffset, n);
-
-    // Create the new position.
-    return PubSubUtil.fromKafkaOffset(targetOffset);
+    return topicMetadataFetcher.advancePosition(tp, startInclusive, n);
   }
 
   public PubSubTopicRepository getTopicRepository() {

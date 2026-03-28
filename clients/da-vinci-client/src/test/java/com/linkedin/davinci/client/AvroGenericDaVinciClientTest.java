@@ -12,14 +12,17 @@ import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertThrows;
 import static org.testng.Assert.assertTrue;
+import static org.testng.Assert.expectThrows;
 import static org.testng.Assert.fail;
 
 import com.linkedin.alpini.base.concurrency.Executors;
@@ -33,7 +36,10 @@ import com.linkedin.venice.client.exceptions.VeniceClientException;
 import com.linkedin.venice.client.store.ClientConfig;
 import com.linkedin.venice.client.store.schemas.TestValueRecord;
 import com.linkedin.venice.controllerapi.D2ServiceDiscoveryResponse;
+import com.linkedin.venice.exceptions.StoreDisabledException;
 import com.linkedin.venice.meta.ReadOnlySchemaRepository;
+import com.linkedin.venice.meta.Store;
+import com.linkedin.venice.meta.SubscriptionBasedReadOnlyStoreRepository;
 import com.linkedin.venice.schema.SchemaEntry;
 import com.linkedin.venice.serializer.AvroSerializer;
 import com.linkedin.venice.service.ICProvider;
@@ -45,6 +51,7 @@ import java.lang.reflect.Field;
 import java.security.AccessController;
 import java.security.PrivilegedAction;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -57,6 +64,8 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import org.apache.avro.Schema;
 import org.apache.logging.log4j.LogManager;
+import org.mockito.ArgumentCaptor;
+import org.mockito.MockedStatic;
 import org.testng.Assert;
 import org.testng.annotations.Test;
 
@@ -94,12 +103,15 @@ public class AvroGenericDaVinciClientTest {
     when(mockBackend.getObjectCache()).thenReturn(null);
 
     ReadOnlySchemaRepository mockSchemaRepository = mock(ReadOnlySchemaRepository.class);
+    SubscriptionBasedReadOnlyStoreRepository mockStoreRepository = mock(SubscriptionBasedReadOnlyStoreRepository.class);
     Schema mockKeySchema = new Schema.Parser().parse("{\"type\": \"int\"}");
     SchemaEntry mockValueSchemaEntry = mock(SchemaEntry.class);
     when(mockValueSchemaEntry.getId()).thenReturn(1);
     when(mockSchemaRepository.getKeySchema(anyString())).thenReturn(new SchemaEntry(1, mockKeySchema));
     when(mockSchemaRepository.getSupersetOrLatestValueSchema(anyString())).thenReturn(mockValueSchemaEntry);
     when(mockBackend.getSchemaRepository()).thenReturn(mockSchemaRepository);
+    when(mockBackend.getStoreRepository()).thenReturn(mockStoreRepository);
+    when(mockStoreRepository.getStoreOrThrow(anyString())).thenReturn(mock(Store.class));
 
     // Use reflection to set the private static daVinciBackend field
     Field backendField = AvroGenericDaVinciClient.class.getDeclaredField("daVinciBackend");
@@ -216,12 +228,15 @@ public class AvroGenericDaVinciClientTest {
     when(mockBackend.getObjectCache()).thenReturn(null);
 
     ReadOnlySchemaRepository mockSchemaRepository = mock(ReadOnlySchemaRepository.class);
+    SubscriptionBasedReadOnlyStoreRepository mockStoreRepository = mock(SubscriptionBasedReadOnlyStoreRepository.class);
     Schema mockKeySchema = new Schema.Parser().parse("{\"type\": \"int\"}");
     SchemaEntry mockValueSchemaEntry = mock(SchemaEntry.class);
     when(mockValueSchemaEntry.getId()).thenReturn(1);
     when(mockSchemaRepository.getKeySchema(anyString())).thenReturn(new SchemaEntry(1, mockKeySchema));
     when(mockSchemaRepository.getSupersetOrLatestValueSchema(anyString())).thenReturn(mockValueSchemaEntry);
     when(mockBackend.getSchemaRepository()).thenReturn(mockSchemaRepository);
+    when(mockBackend.getStoreRepository()).thenReturn(mockStoreRepository);
+    when(mockStoreRepository.getStoreOrThrow(anyString())).thenReturn(mock(Store.class));
 
     // Use reflection to set the private static daVinciBackend field
     Field backendField = AvroGenericDaVinciClient.class.getDeclaredField("daVinciBackend");
@@ -362,6 +377,39 @@ public class AvroGenericDaVinciClientTest {
   }
 
   @Test
+  public void testThrowIfReadsDisabled() {
+    DaVinciBackend mockBackend = mock(DaVinciBackend.class);
+    SubscriptionBasedReadOnlyStoreRepository mockStoreRepo = mock(SubscriptionBasedReadOnlyStoreRepository.class);
+    Store mockStore = mock(Store.class);
+    when(mockStore.isEnableReads()).thenReturn(false);
+    when(mockStoreRepo.getStore("test_store")).thenReturn(mockStore);
+    when(mockBackend.getStoreRepository()).thenReturn(mockStoreRepo);
+
+    try (MockedStatic<AvroGenericDaVinciClient> mockedStatic = mockStatic(AvroGenericDaVinciClient.class)) {
+      mockedStatic.when(AvroGenericDaVinciClient::getBackend).thenReturn(mockBackend);
+      AvroGenericDaVinciClient<Integer, String> client = mock(AvroGenericDaVinciClient.class);
+      doReturn("test_store").when(client).getStoreName();
+      doCallRealMethod().when(client).throwIfReadsDisabled();
+      assertThrows(StoreDisabledException.class, client::throwIfReadsDisabled);
+    }
+  }
+
+  @Test
+  public void testGetDaVinciBackend() throws Exception {
+    Field backendField = AvroGenericDaVinciClient.class.getDeclaredField("daVinciBackend");
+    backendField.setAccessible(true);
+    backendField.set(null, null);
+
+    AvroGenericDaVinciClient<Integer, String> client = mock(AvroGenericDaVinciClient.class);
+    when(client.getStoreName()).thenReturn("test_store");
+    doCallRealMethod().when(client).getDaVinciBackend();
+
+    VeniceClientException exception = expectThrows(VeniceClientException.class, client::getDaVinciBackend);
+    assertTrue(exception.getMessage().contains("DaVinci backend is not initialized"));
+    assertTrue(exception.getMessage().contains("test_store"));
+  }
+
+  @Test
   public void constructorTest() {
     DaVinciConfig daVinciConfig = new DaVinciConfig();
     ClientConfig clientConfig = mock(ClientConfig.class);
@@ -418,7 +466,7 @@ public class AvroGenericDaVinciClientTest {
 
     // Mock the seekToCheckpoint method
     doReturn(CompletableFuture.completedFuture(null)).when(mockStoreBackend)
-        .seekToCheckPoints(anyMap(), eq(Optional.empty()));
+        .seekToCheckpoint(any(DaVinciSeekCheckpointInfo.class), eq(Optional.empty()));
     doReturn(true).when(dvcClient).isReady();
     when(dvcClient.getStoreBackend()).thenReturn(mockStoreBackend);
 
@@ -443,18 +491,103 @@ public class AvroGenericDaVinciClientTest {
     Field backendField = AvroGenericDaVinciClient.class.getDeclaredField("daVinciBackend");
     backendField.setAccessible(true);
     // Mock the seek method
-    doReturn(CompletableFuture.completedFuture(null)).when(mockStoreBackend)
-        .seekToTimestamps(anyMap(), eq(Optional.empty()));
     doReturn(true).when(dvcClient).isReady();
     when(dvcClient.getStoreBackend()).thenReturn(mockStoreBackend);
     Map<Integer, Long> timestamps = new HashMap<>();
     timestamps.put(1, 1000L);
+    doReturn(CompletableFuture.completedFuture(null)).when(mockStoreBackend)
+        .seekToCheckpoint(any(DaVinciSeekCheckpointInfo.class), eq(Optional.empty()));
+
     // Test
     CompletableFuture<Void> future = dvcClient.seekToTimestamps(timestamps);
     future.get(); // Wait for completion
     // Verify
     verify(dvcClient).seekToTimestamps(anyMap());
     assertTrue(future.isDone() && !future.isCompletedExceptionally());
+  }
+
+  @Test
+  public void testSeekToTail() throws Exception {
+    // Setup
+    ClientConfig clientConfig = new ClientConfig(storeName);
+    AvroGenericSeekableDaVinciClient<Integer, String> dvcClient =
+        (AvroGenericSeekableDaVinciClient<Integer, String>) setUpSeekableClient(clientConfig, true);
+
+    // Mock backend
+    StoreBackend mockStoreBackend = mock(StoreBackend.class);
+    // Use reflection to set the private daVinciBackend field
+    Field backendField = AvroGenericDaVinciClient.class.getDeclaredField("daVinciBackend");
+    backendField.setAccessible(true);
+    // Mock the seek method
+    doReturn(CompletableFuture.completedFuture(null)).when(mockStoreBackend)
+        .seekToCheckpoint(any(DaVinciSeekCheckpointInfo.class), eq(Optional.empty()));
+    doReturn(true).when(dvcClient).isReady();
+    doReturn(3).when(dvcClient).getPartitionCount();
+    when(dvcClient.getStoreBackend()).thenReturn(mockStoreBackend);
+    // Test
+    CompletableFuture<Void> future = dvcClient.seekToTail();
+    future.get(); // Wait for completion
+    // Verify
+    verify(dvcClient).seekToTail();
+    assertTrue(future.isDone() && !future.isCompletedExceptionally());
+
+    future = dvcClient.seekToTail(Collections.singleton(1));
+    future.get(); // Wait for completion
+    // Verify
+    verify(dvcClient).seekToTail(Collections.singleton(1));
+    assertTrue(future.isDone() && !future.isCompletedExceptionally());
+
+  }
+
+  @Test
+  public void testSeekToBeginningOfPush() throws Exception {
+    // Setup
+    ClientConfig clientConfig = new ClientConfig(storeName);
+    AvroGenericSeekableDaVinciClient<Integer, String> dvcClient =
+        (AvroGenericSeekableDaVinciClient<Integer, String>) setUpSeekableClient(clientConfig, true);
+
+    // Mock backend
+    StoreBackend mockStoreBackend = mock(StoreBackend.class);
+    // Mock the seek method
+    doReturn(CompletableFuture.completedFuture(null)).when(mockStoreBackend)
+        .seekToCheckpoint(any(DaVinciSeekCheckpointInfo.class), eq(Optional.empty()));
+    doReturn(true).when(dvcClient).isReady();
+    when(dvcClient.getStoreBackend()).thenReturn(mockStoreBackend);
+    // Test
+    CompletableFuture<Void> future = dvcClient.seekToBeginningOfPush(Collections.singleton(1));
+    future.get(); // Wait for completion
+    // Verify the checkpoint info contains partition->EARLIEST mapping
+    ArgumentCaptor<DaVinciSeekCheckpointInfo> captor = ArgumentCaptor.forClass(DaVinciSeekCheckpointInfo.class);
+    verify(mockStoreBackend).seekToCheckpoint(captor.capture(), eq(Optional.empty()));
+    DaVinciSeekCheckpointInfo capturedInfo = captor.getValue();
+    assertEquals(capturedInfo.getSeekMode(), DaVinciSeekCheckpointInfo.SeekMode.POSITION_MAP);
+    assertEquals(
+        capturedInfo.getPositionMap(),
+        Collections.singletonMap(1, com.linkedin.venice.pubsub.api.PubSubSymbolicPosition.EARLIEST));
+    assertTrue(capturedInfo.getPartitions().contains(1));
+    assertFalse(capturedInfo.getPartitions().contains(0));
+  }
+
+  @Test
+  public void testSeekToBeginningOfPushWhenNotReady() throws Exception {
+    // Setup
+    ClientConfig clientConfig = new ClientConfig(storeName);
+    AvroGenericSeekableDaVinciClient<Integer, String> dvcClient =
+        (AvroGenericSeekableDaVinciClient<Integer, String>) setUpSeekableClient(clientConfig, true);
+
+    // Test and verify exception
+    assertThrows(VeniceClientException.class, () -> dvcClient.seekToBeginningOfPush(Collections.emptySet()));
+  }
+
+  @Test
+  public void testSeekToTailWhenNotReady() throws Exception {
+    // Setup
+    ClientConfig clientConfig = new ClientConfig(storeName);
+    AvroGenericSeekableDaVinciClient<Integer, String> dvcClient =
+        (AvroGenericSeekableDaVinciClient<Integer, String>) setUpSeekableClient(clientConfig, true);
+
+    // Test and verify exception
+    assertThrows(VeniceClientException.class, () -> dvcClient.seekToTail(Collections.emptySet()));
   }
 
   @Test
@@ -471,14 +604,11 @@ public class AvroGenericDaVinciClientTest {
     backendField.setAccessible(true);
     // Mock the seek method
     doReturn(CompletableFuture.completedFuture(null)).when(mockStoreBackend)
-        .seekToTimestamps(anyMap(), eq(Optional.empty()));
+        .seekToCheckpoint(any(DaVinciSeekCheckpointInfo.class), eq(Optional.empty()));
     doReturn(false).when(dvcClient).isReady();
     when(dvcClient.getStoreBackend()).thenReturn(mockStoreBackend);
     Map<Integer, Long> timestamps = new HashMap<>();
     timestamps.put(1, 1000L);
-    // Test
-
-    // Test
     // Verify the exception is propagated
     try {
       CompletableFuture<Void> future = dvcClient.seekToTimestamps(timestamps);
@@ -486,5 +616,43 @@ public class AvroGenericDaVinciClientTest {
       fail("Expected exception to be thrown");
     } catch (VeniceClientException e) {
     }
+  }
+
+  @Test
+  public void testDaVinciSeekCheckpointInfoForPositionsWithEarliest() {
+    Map<Integer, com.linkedin.venice.pubsub.api.PubSubPosition> positionMap = new HashMap<>();
+    positionMap.put(0, com.linkedin.venice.pubsub.api.PubSubSymbolicPosition.EARLIEST);
+    positionMap.put(1, com.linkedin.venice.pubsub.api.PubSubSymbolicPosition.EARLIEST);
+    DaVinciSeekCheckpointInfo info = DaVinciSeekCheckpointInfo.forPositions(positionMap);
+    assertEquals(info.getSeekMode(), DaVinciSeekCheckpointInfo.SeekMode.POSITION_MAP);
+    assertTrue(info.getPartitions().contains(0));
+    assertTrue(info.getPartitions().contains(1));
+    assertFalse(info.getPartitions().contains(2));
+    assertEquals(info.getPositionMap(), positionMap);
+  }
+
+  @Test
+  public void testDaVinciSeekCheckpointInfoForTimestamps() {
+    Map<Integer, Long> timestamps = new HashMap<>();
+    timestamps.put(0, 1000L);
+    timestamps.put(1, 2000L);
+    DaVinciSeekCheckpointInfo info = DaVinciSeekCheckpointInfo.forTimestamps(timestamps);
+    assertEquals(info.getSeekMode(), DaVinciSeekCheckpointInfo.SeekMode.TIMESTAMPS_MAP);
+    assertTrue(info.getPartitions().contains(0));
+    assertTrue(info.getPartitions().contains(1));
+    assertFalse(info.getPartitions().contains(2));
+    assertEquals(info.getTimestampsMap(), timestamps);
+  }
+
+  @Test
+  public void testDaVinciSeekCheckpointInfoForPositionsWithLatest() {
+    Map<Integer, com.linkedin.venice.pubsub.api.PubSubPosition> positionMap = new HashMap<>();
+    positionMap.put(0, com.linkedin.venice.pubsub.api.PubSubSymbolicPosition.LATEST);
+    positionMap.put(1, com.linkedin.venice.pubsub.api.PubSubSymbolicPosition.LATEST);
+    DaVinciSeekCheckpointInfo info = DaVinciSeekCheckpointInfo.forPositions(positionMap);
+    assertEquals(info.getSeekMode(), DaVinciSeekCheckpointInfo.SeekMode.POSITION_MAP);
+    assertTrue(info.getPartitions().contains(0));
+    assertTrue(info.getPartitions().contains(1));
+    assertFalse(info.getPartitions().contains(2));
   }
 }

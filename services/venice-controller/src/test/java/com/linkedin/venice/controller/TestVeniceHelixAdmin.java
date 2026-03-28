@@ -52,6 +52,7 @@ import com.linkedin.venice.helix.HelixStoreGraveyard;
 import com.linkedin.venice.helix.SafeHelixDataAccessor;
 import com.linkedin.venice.helix.SafeHelixManager;
 import com.linkedin.venice.ingestion.control.RealTimeTopicSwitcher;
+import com.linkedin.venice.meta.ConcurrentPushDetectionStrategy;
 import com.linkedin.venice.meta.HybridStoreConfig;
 import com.linkedin.venice.meta.Instance;
 import com.linkedin.venice.meta.MaterializedViewParameters;
@@ -67,7 +68,6 @@ import com.linkedin.venice.meta.ViewConfigImpl;
 import com.linkedin.venice.partitioner.DefaultVenicePartitioner;
 import com.linkedin.venice.protocols.controller.PubSubPositionGrpcWireFormat;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
-import com.linkedin.venice.pubsub.adapter.kafka.common.ApacheKafkaOffsetPosition;
 import com.linkedin.venice.pubsub.api.PubSubPosition;
 import com.linkedin.venice.pubsub.api.PubSubTopic;
 import com.linkedin.venice.pubsub.manager.TopicManager;
@@ -301,7 +301,9 @@ public class TestVeniceHelixAdmin {
         anyLong(),
         anyBoolean(),
         any(Optional.class),
-        anyBoolean());
+        anyBoolean(),
+        anyBoolean(),
+        any(Optional.class));
 
     // Case 2: Real-time topic does not exist
     VeniceControllerClusterConfig clusterConfig = mock(VeniceControllerClusterConfig.class);
@@ -315,7 +317,57 @@ public class TestVeniceHelixAdmin {
         anyLong(),
         anyBoolean(),
         any(Optional.class),
-        anyBoolean());
+        anyBoolean(),
+        anyBoolean(),
+        any(Optional.class));
+
+    // Case 3: Unclean leader election config is set to false
+    reset(topicManager);
+    when(clusterConfig.getUncleanLeaderElectionEnableRealTimeTopics()).thenReturn(Optional.of(false));
+    when(topicManager.containsTopic(pubSubTopic)).thenReturn(false);
+    veniceHelixAdmin.createOrUpdateRealTimeTopic(clusterName, store, version, pubSubTopic);
+    verify(topicManager, times(1)).createTopic(
+        eq(pubSubTopic),
+        eq(partitionCount),
+        anyInt(),
+        anyLong(),
+        anyBoolean(),
+        any(Optional.class),
+        anyBoolean(),
+        anyBoolean(),
+        eq(Optional.of(false)));
+
+    // Case 4: Unclean leader election config is set to true
+    reset(topicManager);
+    when(clusterConfig.getUncleanLeaderElectionEnableRealTimeTopics()).thenReturn(Optional.of(true));
+    when(topicManager.containsTopic(pubSubTopic)).thenReturn(false);
+    veniceHelixAdmin.createOrUpdateRealTimeTopic(clusterName, store, version, pubSubTopic);
+    verify(topicManager, times(1)).createTopic(
+        eq(pubSubTopic),
+        eq(partitionCount),
+        anyInt(),
+        anyLong(),
+        anyBoolean(),
+        any(Optional.class),
+        anyBoolean(),
+        anyBoolean(),
+        eq(Optional.of(true)));
+
+    // Case 5: Unclean leader election config is not set (empty)
+    reset(topicManager);
+    when(clusterConfig.getUncleanLeaderElectionEnableRealTimeTopics()).thenReturn(Optional.empty());
+    when(topicManager.containsTopic(pubSubTopic)).thenReturn(false);
+    veniceHelixAdmin.createOrUpdateRealTimeTopic(clusterName, store, version, pubSubTopic);
+    verify(topicManager, times(1)).createTopic(
+        eq(pubSubTopic),
+        eq(partitionCount),
+        anyInt(),
+        anyLong(),
+        anyBoolean(),
+        any(Optional.class),
+        anyBoolean(),
+        anyBoolean(),
+        eq(Optional.empty()));
   }
 
   @Test
@@ -567,7 +619,7 @@ public class TestVeniceHelixAdmin {
     assertTrue(
         topicAbsentException.getMessage().contains("is either absent or being truncated"),
         "Actual message: " + topicAbsentException.getMessage());
-    verify(veniceAdminStats, times(1)).recordUnexpectedTopicAbsenceCount();
+    verify(veniceAdminStats, times(1)).recordUnexpectedTopicAbsenceCount(PushType.BATCH);
 
     // Case 3: Topic exists, all partitions are online, but topic is truncated
     when(topicManager.containsTopicAndAllPartitionsAreOnline(topic, partitionCount)).thenReturn(true);
@@ -579,7 +631,7 @@ public class TestVeniceHelixAdmin {
     assertTrue(
         topicTruncatedException.getMessage().contains("is either absent or being truncated"),
         "Actual message: " + topicTruncatedException.getMessage());
-    verify(veniceAdminStats, times(2)).recordUnexpectedTopicAbsenceCount();
+    verify(veniceAdminStats, times(1)).recordUnexpectedTopicAbsenceCount(INCREMENTAL);
 
     // Case 4: Validate behavior with different PushType (e.g., INCREMENTAL)
     when(topicManager.containsTopicAndAllPartitionsAreOnline(topic, partitionCount)).thenReturn(true);
@@ -981,7 +1033,7 @@ public class TestVeniceHelixAdmin {
 
     // Case 1: Not store name provided
     AdminMetadata remoteMetadata = new AdminMetadata();
-    remoteMetadata.setPubSubPosition(ApacheKafkaOffsetPosition.of(10L));
+    remoteMetadata.setPubSubPosition(InMemoryPubSubPosition.of(10L));
     remoteMetadata.setExecutionId(1L);
     remoteMetadata.setAdminOperationProtocolVersion(1L);
     AdminConsumerService adminConsumerService = mock(AdminConsumerService.class);
@@ -1673,6 +1725,121 @@ public class TestVeniceHelixAdmin {
         expectThrows(VeniceException.class, () -> admin.checkStoreGraveyardForRecreation(clusterName, storeName));
 
     assertTrue(customException.getMessage().contains("Required waiting period: 3600 seconds"));
+  }
+
+  @Test
+  public void testShouldSkipTruncatingTopicForChildControllers() {
+    VeniceHelixAdmin admin = mock(VeniceHelixAdmin.class);
+    VeniceControllerClusterConfig config = mock(VeniceControllerClusterConfig.class);
+
+    Map<String, VeniceControllerClusterConfig> configMap = new HashMap<>();
+    configMap.put(clusterName, config);
+    doReturn(new VeniceControllerMultiClusterConfig(configMap)).when(admin).getMultiClusterConfigs();
+    doReturn(false).when(admin).isParent();
+    doCallRealMethod().when(admin).shouldSkipTruncatingTopic(clusterName);
+
+    boolean shouldSkip = admin.shouldSkipTruncatingTopic(clusterName);
+    verify(admin, times(1)).isParent();
+    assertFalse(shouldSkip);
+  }
+
+  @Test
+  public void testShouldSkipTruncatingTopicForParentControllersTopicWriteNeeded() {
+    VeniceHelixAdmin admin = mock(VeniceHelixAdmin.class);
+    VeniceControllerClusterConfig config = mock(VeniceControllerClusterConfig.class);
+    Map<String, VeniceControllerClusterConfig> configMap = new HashMap<>();
+    configMap.put(clusterName, config);
+    doReturn(new VeniceControllerMultiClusterConfig(configMap)).when(admin).getMultiClusterConfigs();
+    doReturn(true).when(admin).isParent();
+    doCallRealMethod().when(admin).shouldSkipTruncatingTopic(clusterName);
+
+    doReturn(ConcurrentPushDetectionStrategy.TOPIC_BASED_ONLY).when(config).getConcurrentPushDetectionStrategy();
+    boolean shouldSkip = admin.shouldSkipTruncatingTopic(clusterName);
+    verify(admin, times(1)).getMultiClusterConfigs();
+    verify(admin, times(1)).isParent();
+    assertFalse(shouldSkip);
+
+    doReturn(ConcurrentPushDetectionStrategy.DUAL).when(config).getConcurrentPushDetectionStrategy();
+    boolean shouldSkip2 = admin.shouldSkipTruncatingTopic(clusterName);
+    verify(admin, times(2)).getMultiClusterConfigs();
+    verify(admin, times(2)).isParent();
+    assertFalse(shouldSkip2);
+
+  }
+
+  @Test
+  public void testShouldSkipTruncatingTopicForParentControllersTopicWriteNotNeeded() {
+    VeniceHelixAdmin admin = mock(VeniceHelixAdmin.class);
+    VeniceControllerClusterConfig config = mock(VeniceControllerClusterConfig.class);
+    doReturn(ConcurrentPushDetectionStrategy.PARENT_VERSION_STATUS_ONLY).when(config)
+        .getConcurrentPushDetectionStrategy();
+    doReturn(true).when(admin).isParent();
+
+    Map<String, VeniceControllerClusterConfig> configMap = new HashMap<>();
+    configMap.put(clusterName, config);
+    doReturn(new VeniceControllerMultiClusterConfig(configMap)).when(admin).getMultiClusterConfigs();
+    doCallRealMethod().when(admin).shouldSkipTruncatingTopic(clusterName);
+
+    boolean shouldSkip = admin.shouldSkipTruncatingTopic(clusterName);
+    verify(admin, times(1)).getMultiClusterConfigs();
+    verify(admin, times(1)).isParent();
+    assertTrue(shouldSkip);
+  }
+
+  @Test
+  public void testUpdateStoreTTLRepushFlag() {
+    Store store = mock(Store.class);
+    ReadWriteStoreRepository repository = mock(ReadWriteStoreRepository.class);
+
+    // TTL repush should set flag to true when currently false
+    String ttlRepushId = Version.generateTTLRePushId("test-push");
+    when(store.isTTLRepushEnabled()).thenReturn(false);
+    VeniceHelixAdmin.updateStoreTTLRepushFlag(ttlRepushId, store, repository);
+    verify(store).setTTLRepushEnabled(true);
+    verify(repository).updateStore(store);
+
+    reset(store, repository);
+
+    // TTL repush should not update when flag is already true
+    when(store.isTTLRepushEnabled()).thenReturn(true);
+    VeniceHelixAdmin.updateStoreTTLRepushFlag(ttlRepushId, store, repository);
+    verify(store, never()).setTTLRepushEnabled(anyBoolean());
+    verify(repository, never()).updateStore(any());
+
+    reset(store, repository);
+
+    // Regular push with TTL repush should set flag to false when currently true
+    String regularPushWithTtlId = Version.generateRegularPushWithTTLRePushId("test-push");
+    when(store.isTTLRepushEnabled()).thenReturn(true);
+    VeniceHelixAdmin.updateStoreTTLRepushFlag(regularPushWithTtlId, store, repository);
+    verify(store).setTTLRepushEnabled(false);
+    verify(repository).updateStore(store);
+
+    reset(store, repository);
+
+    // Regular push with TTL repush should not update when flag is already false
+    when(store.isTTLRepushEnabled()).thenReturn(false);
+    VeniceHelixAdmin.updateStoreTTLRepushFlag(regularPushWithTtlId, store, repository);
+    verify(store, never()).setTTLRepushEnabled(anyBoolean());
+    verify(repository, never()).updateStore(any());
+
+    reset(store, repository);
+
+    // Compliance push should not affect the TTL flag
+    String compliancePushId = Version.generateCompliancePushId("test-push");
+    when(store.isTTLRepushEnabled()).thenReturn(true);
+    VeniceHelixAdmin.updateStoreTTLRepushFlag(compliancePushId, store, repository);
+    verify(store, never()).setTTLRepushEnabled(anyBoolean());
+    verify(repository, never()).updateStore(any());
+
+    reset(store, repository);
+
+    // Regular user push should not affect the TTL flag
+    String userPushId = System.currentTimeMillis() + "_https://example.com/user-push";
+    when(store.isTTLRepushEnabled()).thenReturn(true);
+    VeniceHelixAdmin.updateStoreTTLRepushFlag(userPushId, store, repository);
+    verify(store, never()).setTTLRepushEnabled(anyBoolean());
+    verify(repository, never()).updateStore(any());
   }
 
 }

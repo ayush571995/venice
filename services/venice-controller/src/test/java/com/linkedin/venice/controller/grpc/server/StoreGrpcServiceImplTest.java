@@ -16,7 +16,12 @@ import static org.testng.Assert.expectThrows;
 import com.linkedin.venice.controller.grpc.GrpcRequestResponseConverter;
 import com.linkedin.venice.controller.server.StoreRequestHandler;
 import com.linkedin.venice.controller.server.VeniceControllerAccessManager;
+import com.linkedin.venice.controllerapi.RepushInfo;
 import com.linkedin.venice.exceptions.VeniceException;
+import com.linkedin.venice.exceptions.VeniceNoStoreException;
+import com.linkedin.venice.meta.StoreInfo;
+import com.linkedin.venice.meta.Version;
+import com.linkedin.venice.meta.VersionStatus;
 import com.linkedin.venice.protocols.controller.ClusterStoreGrpcInfo;
 import com.linkedin.venice.protocols.controller.ControllerGrpcErrorType;
 import com.linkedin.venice.protocols.controller.CreateStoreGrpcRequest;
@@ -25,18 +30,33 @@ import com.linkedin.venice.protocols.controller.DeleteAclForStoreGrpcRequest;
 import com.linkedin.venice.protocols.controller.DeleteAclForStoreGrpcResponse;
 import com.linkedin.venice.protocols.controller.GetAclForStoreGrpcRequest;
 import com.linkedin.venice.protocols.controller.GetAclForStoreGrpcResponse;
+import com.linkedin.venice.protocols.controller.GetRepushInfoGrpcRequest;
+import com.linkedin.venice.protocols.controller.GetRepushInfoGrpcResponse;
+import com.linkedin.venice.protocols.controller.GetStoreGrpcRequest;
+import com.linkedin.venice.protocols.controller.GetStoreGrpcResponse;
+import com.linkedin.venice.protocols.controller.GetStoreStatusRequest;
+import com.linkedin.venice.protocols.controller.GetStoreStatusResponse;
+import com.linkedin.venice.protocols.controller.ListStoresGrpcRequest;
+import com.linkedin.venice.protocols.controller.ListStoresGrpcResponse;
 import com.linkedin.venice.protocols.controller.ResourceCleanupCheckGrpcResponse;
 import com.linkedin.venice.protocols.controller.StoreGrpcServiceGrpc;
 import com.linkedin.venice.protocols.controller.StoreGrpcServiceGrpc.StoreGrpcServiceBlockingStub;
+import com.linkedin.venice.protocols.controller.StoreStatus;
 import com.linkedin.venice.protocols.controller.UpdateAclForStoreGrpcRequest;
 import com.linkedin.venice.protocols.controller.UpdateAclForStoreGrpcResponse;
+import com.linkedin.venice.protocols.controller.ValidateStoreDeletedGrpcRequest;
+import com.linkedin.venice.protocols.controller.ValidateStoreDeletedGrpcResponse;
 import com.linkedin.venice.protocols.controller.VeniceControllerGrpcErrorInfo;
+import com.linkedin.venice.protocols.controller.VersionStatusGrpc;
 import io.grpc.ManagedChannel;
 import io.grpc.Server;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.inprocess.InProcessChannelBuilder;
 import io.grpc.inprocess.InProcessServerBuilder;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
@@ -265,5 +285,346 @@ public class StoreGrpcServiceImplTest {
     assertEquals(response.getStoreInfo(), request, "Store info should match");
     assertTrue(response.getHasLingeringResources(), "Lingering resources should be true");
     assertTrue(response.getDescription().isEmpty(), "Description should be empty");
+  }
+
+  @Test
+  public void testValidateStoreDeletedReturnsSuccessfulResponseWhenStoreIsDeleted() {
+    when(controllerAccessManager.isAllowListUser(anyString(), any())).thenReturn(true);
+    ClusterStoreGrpcInfo storeInfo =
+        ClusterStoreGrpcInfo.newBuilder().setClusterName(TEST_CLUSTER).setStoreName(TEST_STORE).build();
+    ValidateStoreDeletedGrpcRequest request =
+        ValidateStoreDeletedGrpcRequest.newBuilder().setStoreInfo(storeInfo).build();
+    ValidateStoreDeletedGrpcResponse response =
+        ValidateStoreDeletedGrpcResponse.newBuilder().setStoreInfo(storeInfo).setStoreDeleted(true).build();
+    when(storeRequestHandler.validateStoreDeleted(any(ValidateStoreDeletedGrpcRequest.class))).thenReturn(response);
+
+    ValidateStoreDeletedGrpcResponse actualResponse = blockingStub.validateStoreDeleted(request);
+
+    assertNotNull(actualResponse, "Response should not be null");
+    assertEquals(actualResponse.getStoreInfo(), storeInfo, "Store info should match");
+    assertTrue(actualResponse.getStoreDeleted(), "Store should be marked as deleted");
+    assertFalse(actualResponse.hasReason(), "Reason should not be set when store is deleted");
+  }
+
+  @Test
+  public void testValidateStoreDeletedReturnsSuccessfulResponseWhenStoreIsNotDeleted() {
+    when(controllerAccessManager.isAllowListUser(anyString(), any())).thenReturn(true);
+    ClusterStoreGrpcInfo storeInfo =
+        ClusterStoreGrpcInfo.newBuilder().setClusterName(TEST_CLUSTER).setStoreName(TEST_STORE).build();
+    ValidateStoreDeletedGrpcRequest request =
+        ValidateStoreDeletedGrpcRequest.newBuilder().setStoreInfo(storeInfo).build();
+    String reason = "Store config still exists in ZooKeeper";
+    ValidateStoreDeletedGrpcResponse response = ValidateStoreDeletedGrpcResponse.newBuilder()
+        .setStoreInfo(storeInfo)
+        .setStoreDeleted(false)
+        .setReason(reason)
+        .build();
+    when(storeRequestHandler.validateStoreDeleted(any(ValidateStoreDeletedGrpcRequest.class))).thenReturn(response);
+
+    ValidateStoreDeletedGrpcResponse actualResponse = blockingStub.validateStoreDeleted(request);
+
+    assertNotNull(actualResponse, "Response should not be null");
+    assertEquals(actualResponse.getStoreInfo(), storeInfo, "Store info should match");
+    assertFalse(actualResponse.getStoreDeleted(), "Store should be marked as not deleted");
+    assertTrue(actualResponse.hasReason(), "Reason should be set when store is not deleted");
+    assertEquals(actualResponse.getReason(), reason, "Reason should match");
+  }
+
+  @Test
+  public void testValidateStoreDeletedReturnsErrorResponse() {
+    when(controllerAccessManager.isAllowListUser(anyString(), any())).thenReturn(true);
+    ClusterStoreGrpcInfo storeInfo =
+        ClusterStoreGrpcInfo.newBuilder().setClusterName(TEST_CLUSTER).setStoreName(TEST_STORE).build();
+    ValidateStoreDeletedGrpcRequest request =
+        ValidateStoreDeletedGrpcRequest.newBuilder().setStoreInfo(storeInfo).build();
+    when(storeRequestHandler.validateStoreDeleted(any(ValidateStoreDeletedGrpcRequest.class)))
+        .thenThrow(new VeniceException("Failed to validate store deletion"));
+
+    StatusRuntimeException e =
+        expectThrows(StatusRuntimeException.class, () -> blockingStub.validateStoreDeleted(request));
+
+    assertNotNull(e.getStatus(), "Status should not be null");
+    assertEquals(e.getStatus().getCode(), Status.INTERNAL.getCode());
+    VeniceControllerGrpcErrorInfo errorInfo = GrpcRequestResponseConverter.parseControllerGrpcError(e);
+    assertNotNull(errorInfo, "Error info should not be null");
+    assertEquals(errorInfo.getErrorType(), ControllerGrpcErrorType.GENERAL_ERROR);
+    assertTrue(errorInfo.getErrorMessage().contains("Failed to validate store deletion"));
+  }
+
+  @Test
+  public void testValidateStoreDeletedReturnsBadRequestForInvalidArgument() {
+    when(controllerAccessManager.isAllowListUser(anyString(), any())).thenReturn(true);
+    ClusterStoreGrpcInfo storeInfo =
+        ClusterStoreGrpcInfo.newBuilder().setClusterName(TEST_CLUSTER).setStoreName(TEST_STORE).build();
+    ValidateStoreDeletedGrpcRequest request =
+        ValidateStoreDeletedGrpcRequest.newBuilder().setStoreInfo(storeInfo).build();
+    when(storeRequestHandler.validateStoreDeleted(any(ValidateStoreDeletedGrpcRequest.class)))
+        .thenThrow(new IllegalArgumentException("Cluster name is mandatory parameter"));
+
+    StatusRuntimeException e =
+        expectThrows(StatusRuntimeException.class, () -> blockingStub.validateStoreDeleted(request));
+
+    assertNotNull(e.getStatus(), "Status should not be null");
+    assertEquals(e.getStatus().getCode(), Status.INVALID_ARGUMENT.getCode());
+    VeniceControllerGrpcErrorInfo errorInfo = GrpcRequestResponseConverter.parseControllerGrpcError(e);
+    assertNotNull(errorInfo, "Error info should not be null");
+    assertEquals(errorInfo.getErrorType(), ControllerGrpcErrorType.BAD_REQUEST);
+    assertTrue(errorInfo.getErrorMessage().contains("Cluster name is mandatory parameter"));
+  }
+
+  @Test
+  public void testValidateStoreDeletedReturnsPermissionDenied() {
+    when(controllerAccessManager.isAllowListUser(anyString(), any())).thenReturn(false);
+    ClusterStoreGrpcInfo storeInfo =
+        ClusterStoreGrpcInfo.newBuilder().setClusterName(TEST_CLUSTER).setStoreName(TEST_STORE).build();
+    ValidateStoreDeletedGrpcRequest request =
+        ValidateStoreDeletedGrpcRequest.newBuilder().setStoreInfo(storeInfo).build();
+
+    StatusRuntimeException e =
+        expectThrows(StatusRuntimeException.class, () -> blockingStub.validateStoreDeleted(request));
+
+    assertNotNull(e.getStatus(), "Status should not be null");
+    assertEquals(e.getStatus().getCode(), Status.PERMISSION_DENIED.getCode());
+    VeniceControllerGrpcErrorInfo errorInfo = GrpcRequestResponseConverter.parseControllerGrpcError(e);
+    assertNotNull(errorInfo, "Error info should not be null");
+    assertEquals(errorInfo.getErrorType(), ControllerGrpcErrorType.UNAUTHORIZED);
+    assertTrue(
+        errorInfo.getErrorMessage().contains("Only admin users are allowed to run"),
+        "Actual: " + errorInfo.getErrorMessage());
+  }
+
+  @Test
+  public void testListStoresReturnsSuccessfulResponse() {
+    ListStoresGrpcRequest request = ListStoresGrpcRequest.newBuilder().setClusterName(TEST_CLUSTER).build();
+    ListStoresGrpcResponse expectedResponse = ListStoresGrpcResponse.newBuilder()
+        .setClusterName(TEST_CLUSTER)
+        .addAllStoreNames(Arrays.asList("store1", "store2", "store3"))
+        .build();
+    when(storeRequestHandler.listStores(any(ListStoresGrpcRequest.class))).thenReturn(expectedResponse);
+
+    ListStoresGrpcResponse actualResponse = blockingStub.listStores(request);
+
+    assertNotNull(actualResponse, "Response should not be null");
+    assertEquals(actualResponse.getClusterName(), TEST_CLUSTER, "Cluster name should match");
+    assertEquals(actualResponse.getStoreNamesCount(), 3, "Should have 3 stores");
+    assertEquals(actualResponse.getStoreNames(0), "store1", "First store should be store1");
+    assertEquals(actualResponse.getStoreNames(1), "store2", "Second store should be store2");
+    assertEquals(actualResponse.getStoreNames(2), "store3", "Third store should be store3");
+  }
+
+  @Test
+  public void testListStoresReturnsErrorResponse() {
+    ListStoresGrpcRequest request = ListStoresGrpcRequest.newBuilder().setClusterName(TEST_CLUSTER).build();
+    when(storeRequestHandler.listStores(any(ListStoresGrpcRequest.class)))
+        .thenThrow(new VeniceException("Failed to list stores"));
+
+    StatusRuntimeException e = expectThrows(StatusRuntimeException.class, () -> blockingStub.listStores(request));
+
+    assertNotNull(e.getStatus(), "Status should not be null");
+    assertEquals(e.getStatus().getCode(), Status.INTERNAL.getCode());
+    VeniceControllerGrpcErrorInfo errorInfo = GrpcRequestResponseConverter.parseControllerGrpcError(e);
+    assertNotNull(errorInfo, "Error info should not be null");
+    assertEquals(errorInfo.getErrorType(), ControllerGrpcErrorType.GENERAL_ERROR);
+    assertTrue(errorInfo.getErrorMessage().contains("Failed to list stores"));
+  }
+
+  @Test
+  public void testListStoresReturnsBadRequestForMissingClusterName() {
+    ListStoresGrpcRequest request = ListStoresGrpcRequest.newBuilder().build();
+    when(storeRequestHandler.listStores(any(ListStoresGrpcRequest.class)))
+        .thenThrow(new IllegalArgumentException("Cluster name is required"));
+
+    StatusRuntimeException e = expectThrows(StatusRuntimeException.class, () -> blockingStub.listStores(request));
+
+    assertNotNull(e.getStatus(), "Status should not be null");
+    assertEquals(e.getStatus().getCode(), Status.INVALID_ARGUMENT.getCode());
+    VeniceControllerGrpcErrorInfo errorInfo = GrpcRequestResponseConverter.parseControllerGrpcError(e);
+    assertNotNull(errorInfo, "Error info should not be null");
+    assertEquals(errorInfo.getErrorType(), ControllerGrpcErrorType.BAD_REQUEST);
+    assertTrue(errorInfo.getErrorMessage().contains("Cluster name is required"));
+  }
+
+  @Test
+  public void testListStoresWithFilters() {
+    ListStoresGrpcRequest request =
+        ListStoresGrpcRequest.newBuilder().setClusterName(TEST_CLUSTER).setIncludeSystemStores(false).build();
+    ListStoresGrpcResponse expectedResponse = ListStoresGrpcResponse.newBuilder()
+        .setClusterName(TEST_CLUSTER)
+        .addAllStoreNames(Arrays.asList("store1"))
+        .build();
+    when(storeRequestHandler.listStores(any(ListStoresGrpcRequest.class))).thenReturn(expectedResponse);
+
+    ListStoresGrpcResponse actualResponse = blockingStub.listStores(request);
+
+    assertNotNull(actualResponse, "Response should not be null");
+    assertEquals(actualResponse.getClusterName(), TEST_CLUSTER, "Cluster name should match");
+    assertEquals(actualResponse.getStoreNamesCount(), 1, "Should have 1 store after filtering");
+  }
+
+  @Test
+  public void testGetStoreStatusesReturnsSuccessfulResponse() {
+    GetStoreStatusRequest request = GetStoreStatusRequest.newBuilder().setClusterName(TEST_CLUSTER).build();
+    Map<String, String> storeStatusMap = new HashMap<>();
+    storeStatusMap.put("store1", "ONLINE");
+    storeStatusMap.put("store2", "DEGRADED");
+    storeStatusMap.put("store3", "UNAVAILABLE");
+    when(storeRequestHandler.getStoreStatuses(TEST_CLUSTER)).thenReturn(storeStatusMap);
+
+    GetStoreStatusResponse actualResponse = blockingStub.getStoreStatuses(request);
+
+    assertNotNull(actualResponse, "Response should not be null");
+    assertEquals(actualResponse.getClusterName(), TEST_CLUSTER, "Cluster name should match");
+    assertEquals(actualResponse.getStoreStatusesCount(), 3, "Should have 3 stores");
+
+    // Verify each store status
+    Map<String, String> responseMap = new HashMap<>();
+    for (StoreStatus status: actualResponse.getStoreStatusesList()) {
+      responseMap.put(status.getStoreName(), status.getStatus());
+    }
+    assertEquals(responseMap.get("store1"), "ONLINE", "store1 should be ONLINE");
+    assertEquals(responseMap.get("store2"), "DEGRADED", "store2 should be DEGRADED");
+    assertEquals(responseMap.get("store3"), "UNAVAILABLE", "store3 should be UNAVAILABLE");
+  }
+
+  @Test
+  public void testGetStoreStatusesReturnsEmptyMapWhenNoStores() {
+    GetStoreStatusRequest request = GetStoreStatusRequest.newBuilder().setClusterName(TEST_CLUSTER).build();
+    when(storeRequestHandler.getStoreStatuses(TEST_CLUSTER)).thenReturn(new HashMap<>());
+
+    GetStoreStatusResponse actualResponse = blockingStub.getStoreStatuses(request);
+
+    assertNotNull(actualResponse, "Response should not be null");
+    assertEquals(actualResponse.getClusterName(), TEST_CLUSTER, "Cluster name should match");
+    assertEquals(actualResponse.getStoreStatusesCount(), 0, "Should have 0 stores");
+  }
+
+  @Test
+  public void testGetStoreStatusesReturnsErrorResponse() {
+    GetStoreStatusRequest request = GetStoreStatusRequest.newBuilder().setClusterName(TEST_CLUSTER).build();
+    when(storeRequestHandler.getStoreStatuses(TEST_CLUSTER))
+        .thenThrow(new VeniceException("Failed to get store statuses"));
+
+    StatusRuntimeException e = expectThrows(StatusRuntimeException.class, () -> blockingStub.getStoreStatuses(request));
+
+    assertNotNull(e.getStatus(), "Status should not be null");
+    assertEquals(e.getStatus().getCode(), Status.INTERNAL.getCode());
+    VeniceControllerGrpcErrorInfo errorInfo = GrpcRequestResponseConverter.parseControllerGrpcError(e);
+    assertNotNull(errorInfo, "Error info should not be null");
+    assertEquals(errorInfo.getErrorType(), ControllerGrpcErrorType.GENERAL_ERROR);
+    assertTrue(errorInfo.getErrorMessage().contains("Failed to get store statuses"));
+  }
+
+  @Test
+  public void testGetStoreStatusesReturnsBadRequestForMissingClusterName() {
+    GetStoreStatusRequest request = GetStoreStatusRequest.newBuilder().build();
+    when(storeRequestHandler.getStoreStatuses("")).thenThrow(new IllegalArgumentException("Cluster name is required"));
+
+    StatusRuntimeException e = expectThrows(StatusRuntimeException.class, () -> blockingStub.getStoreStatuses(request));
+
+    assertNotNull(e.getStatus(), "Status should not be null");
+    assertEquals(e.getStatus().getCode(), Status.INVALID_ARGUMENT.getCode());
+    VeniceControllerGrpcErrorInfo errorInfo = GrpcRequestResponseConverter.parseControllerGrpcError(e);
+    assertNotNull(errorInfo, "Error info should not be null");
+    assertEquals(errorInfo.getErrorType(), ControllerGrpcErrorType.BAD_REQUEST);
+    assertTrue(errorInfo.getErrorMessage().contains("Cluster name is required"));
+  }
+
+  @Test
+  public void testGetRepushInfoReturnsSuccessfulResponse() {
+    ClusterStoreGrpcInfo storeInfo =
+        ClusterStoreGrpcInfo.newBuilder().setClusterName(TEST_CLUSTER).setStoreName(TEST_STORE).build();
+    GetRepushInfoGrpcRequest request =
+        GetRepushInfoGrpcRequest.newBuilder().setStoreInfo(storeInfo).setFabric("test-fabric").build();
+
+    Version mockVersion = mock(Version.class);
+    when(mockVersion.getNumber()).thenReturn(1);
+    when(mockVersion.getCreatedTime()).thenReturn(123456789L);
+    when(mockVersion.getStatus()).thenReturn(VersionStatus.ONLINE);
+    when(mockVersion.getPushJobId()).thenReturn("test-push-job");
+    when(mockVersion.getPartitionCount()).thenReturn(10);
+    when(mockVersion.getReplicationFactor()).thenReturn(3);
+
+    RepushInfo repushInfo = RepushInfo.createRepushInfo(mockVersion, "kafka.broker:9092", "d2-service", "zk-host");
+
+    when(storeRequestHandler.getRepushInfo(anyString(), anyString(), any())).thenReturn(repushInfo);
+
+    GetRepushInfoGrpcResponse actualResponse = blockingStub.getRepushInfo(request);
+
+    assertNotNull(actualResponse);
+    assertEquals(actualResponse.getStoreInfo(), storeInfo);
+    assertEquals(actualResponse.getRepushInfo().getPubSubUrl(), "kafka.broker:9092");
+    assertTrue(actualResponse.getRepushInfo().hasVersion());
+    assertEquals(actualResponse.getRepushInfo().getVersion().getNumber(), 1);
+    assertEquals(
+        actualResponse.getRepushInfo().getVersion().getStatus(),
+        VersionStatusGrpc.forNumber(VersionStatus.ONLINE.getValue()));
+  }
+
+  @Test
+  public void testGetRepushInfoReturnsErrorResponse() {
+    ClusterStoreGrpcInfo storeInfo =
+        ClusterStoreGrpcInfo.newBuilder().setClusterName(TEST_CLUSTER).setStoreName(TEST_STORE).build();
+    GetRepushInfoGrpcRequest request = GetRepushInfoGrpcRequest.newBuilder().setStoreInfo(storeInfo).build();
+
+    when(storeRequestHandler.getRepushInfo(anyString(), anyString(), any()))
+        .thenThrow(new VeniceException("Failed to get repush info"));
+
+    StatusRuntimeException e = expectThrows(StatusRuntimeException.class, () -> blockingStub.getRepushInfo(request));
+
+    assertEquals(e.getStatus().getCode(), Status.INTERNAL.getCode());
+  }
+
+  @Test
+  public void testGetRepushInfoWithoutFabric() {
+    ClusterStoreGrpcInfo storeInfo =
+        ClusterStoreGrpcInfo.newBuilder().setClusterName(TEST_CLUSTER).setStoreName(TEST_STORE).build();
+    GetRepushInfoGrpcRequest request = GetRepushInfoGrpcRequest.newBuilder().setStoreInfo(storeInfo).build();
+
+    RepushInfo repushInfo = RepushInfo.createRepushInfo(null, "another.kafka.broker:9092", null, null);
+
+    when(storeRequestHandler.getRepushInfo(anyString(), anyString(), any())).thenReturn(repushInfo);
+
+    GetRepushInfoGrpcResponse actualResponse = blockingStub.getRepushInfo(request);
+
+    assertNotNull(actualResponse);
+    assertEquals(actualResponse.getRepushInfo().getPubSubUrl(), "another.kafka.broker:9092");
+    assertFalse(actualResponse.getRepushInfo().hasVersion());
+  }
+
+  @Test
+  public void testGetStoreReturnsSuccessfulResponse() {
+    ClusterStoreGrpcInfo storeInfo =
+        ClusterStoreGrpcInfo.newBuilder().setClusterName(TEST_CLUSTER).setStoreName(TEST_STORE).build();
+    GetStoreGrpcRequest request = GetStoreGrpcRequest.newBuilder().setStoreInfo(storeInfo).build();
+
+    // Mock handler returning StoreInfo
+    StoreInfo mockStoreInfo = new StoreInfo();
+    mockStoreInfo.setName(TEST_STORE);
+    mockStoreInfo.setOwner(OWNER);
+    when(storeRequestHandler.getStore(TEST_CLUSTER, TEST_STORE)).thenReturn(mockStoreInfo);
+
+    GetStoreGrpcResponse actualResponse = blockingStub.getStore(request);
+
+    assertNotNull(actualResponse, "Response should not be null");
+    assertEquals(actualResponse.getStoreInfo().getClusterName(), TEST_CLUSTER, "Cluster name should match");
+    assertEquals(actualResponse.getStoreInfo().getStoreName(), TEST_STORE, "Store name should match");
+    assertTrue(actualResponse.getStoreInfoJson().contains(TEST_STORE), "Store info JSON should contain store name");
+  }
+
+  @Test
+  public void testGetStoreReturnsErrorResponse() {
+    ClusterStoreGrpcInfo storeInfo =
+        ClusterStoreGrpcInfo.newBuilder().setClusterName(TEST_CLUSTER).setStoreName(TEST_STORE).build();
+    GetStoreGrpcRequest request = GetStoreGrpcRequest.newBuilder().setStoreInfo(storeInfo).build();
+    when(storeRequestHandler.getStore(TEST_CLUSTER, TEST_STORE)).thenThrow(new VeniceNoStoreException(TEST_STORE));
+
+    StatusRuntimeException e = expectThrows(StatusRuntimeException.class, () -> blockingStub.getStore(request));
+
+    assertNotNull(e.getStatus(), "Status should not be null");
+    assertEquals(e.getStatus().getCode(), Status.NOT_FOUND.getCode());
+    VeniceControllerGrpcErrorInfo errorInfo = GrpcRequestResponseConverter.parseControllerGrpcError(e);
+    assertNotNull(errorInfo, "Error info should not be null");
+    assertEquals(errorInfo.getErrorType(), ControllerGrpcErrorType.STORE_NOT_FOUND);
+    assertTrue(errorInfo.getErrorMessage().contains(TEST_STORE));
   }
 }

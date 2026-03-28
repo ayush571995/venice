@@ -19,21 +19,28 @@ import com.linkedin.venice.controller.VeniceHelixAdmin;
 import com.linkedin.venice.controller.VeniceParentHelixAdmin;
 import com.linkedin.venice.controllerapi.ControllerApiConstants;
 import com.linkedin.venice.controllerapi.MultiStoreInfoResponse;
+import com.linkedin.venice.controllerapi.MultiStoreResponse;
 import com.linkedin.venice.controllerapi.MultiStoreStatusResponse;
+import com.linkedin.venice.controllerapi.RepushInfo;
+import com.linkedin.venice.controllerapi.RepushInfoResponse;
 import com.linkedin.venice.controllerapi.RepushJobResponse;
+import com.linkedin.venice.controllerapi.StoreDeletedValidationResponse;
 import com.linkedin.venice.controllerapi.StoreMigrationResponse;
 import com.linkedin.venice.controllerapi.StoreResponse;
 import com.linkedin.venice.controllerapi.SystemStoreHeartbeatResponse;
 import com.linkedin.venice.controllerapi.TrackableControllerResponse;
 import com.linkedin.venice.exceptions.ErrorType;
 import com.linkedin.venice.exceptions.VeniceException;
-import com.linkedin.venice.meta.OfflinePushStrategy;
-import com.linkedin.venice.meta.PersistenceType;
-import com.linkedin.venice.meta.ReadStrategy;
-import com.linkedin.venice.meta.RoutingStrategy;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.StoreInfo;
-import com.linkedin.venice.meta.ZKStore;
+import com.linkedin.venice.meta.Version;
+import com.linkedin.venice.meta.VersionImpl;
+import com.linkedin.venice.meta.VersionStatus;
+import com.linkedin.venice.protocols.controller.ClusterStoreGrpcInfo;
+import com.linkedin.venice.protocols.controller.ListStoresGrpcRequest;
+import com.linkedin.venice.protocols.controller.ListStoresGrpcResponse;
+import com.linkedin.venice.protocols.controller.ValidateStoreDeletedGrpcRequest;
+import com.linkedin.venice.protocols.controller.ValidateStoreDeletedGrpcResponse;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
 import com.linkedin.venice.utils.ObjectMapperFactory;
 import java.util.Arrays;
@@ -304,27 +311,23 @@ public class StoresRoutesTest {
   /** Testing getStore API code paths for code coverage purposes */
   @Test
   public void testGetStore() throws Exception {
-    final Store testStore = new ZKStore(
-        TEST_STORE_NAME,
-        "owner",
-        System.currentTimeMillis(),
-        PersistenceType.IN_MEMORY,
-        RoutingStrategy.CONSISTENT_HASH,
-        ReadStrategy.ANY_OF_ONLINE,
-        OfflinePushStrategy.WAIT_N_MINUS_ONE_REPLCIA_PER_PARTITION,
-        1);
-
     final int testMaxRecordSizeBytesValue = 33333;
     final Admin mockAdmin = mock(VeniceParentHelixAdmin.class);
     doReturn(true).when(mockAdmin).isLeaderControllerFor(TEST_CLUSTER);
-    doReturn(testStore).when(mockAdmin).getStore(TEST_CLUSTER, TEST_STORE_NAME);
-    doReturn(testMaxRecordSizeBytesValue).when(mockAdmin).getDefaultMaxRecordSizeBytes();
+
+    // Mock handler returning StoreInfo
+    final StoreRequestHandler mockHandler = mock(StoreRequestHandler.class);
+    StoreInfo storeInfo = new StoreInfo();
+    storeInfo.setName(TEST_STORE_NAME);
+    storeInfo.setOwner("owner");
+    storeInfo.setMaxRecordSizeBytes(testMaxRecordSizeBytesValue);
+    doReturn(storeInfo).when(mockHandler).getStore(TEST_CLUSTER, TEST_STORE_NAME);
 
     final Request request = mock(Request.class);
     doReturn(TEST_CLUSTER).when(request).queryParams(eq(ControllerApiConstants.CLUSTER));
     doReturn(TEST_STORE_NAME).when(request).queryParams(eq(ControllerApiConstants.NAME));
 
-    final StoresRoutes storesRoutes = new StoresRoutes(false, Optional.empty(), pubSubTopicRepository);
+    final StoresRoutes storesRoutes = new StoresRoutes(false, Optional.empty(), pubSubTopicRepository, mockHandler);
     final StoreResponse response = ObjectMapperFactory.getInstance()
         .readValue(
             storesRoutes.getStore(mockAdmin).handle(request, mock(Response.class)).toString(),
@@ -498,5 +501,328 @@ public class StoresRoutesTest {
         .readValue(getDeadStoresRoute.handle(request4, mock(Response.class)).toString(), MultiStoreInfoResponse.class);
     Assert.assertEquals(response4.getCluster(), TEST_CLUSTER);
     Assert.assertEquals(response4.getStoreInfoList().size(), 1);
+  }
+
+  @Test
+  public void testValidateStoreDeleted() throws Exception {
+    Admin mockAdmin = mock(VeniceParentHelixAdmin.class);
+    StoreRequestHandler mockRequestHandler = mock(StoreRequestHandler.class);
+    doReturn(true).when(mockAdmin).isLeaderControllerFor(TEST_CLUSTER);
+
+    Request request = mock(Request.class);
+    doReturn(TEST_CLUSTER).when(request).queryParams(eq(ControllerApiConstants.CLUSTER));
+    doReturn(TEST_STORE_NAME).when(request).queryParams(eq(ControllerApiConstants.STORE_NAME));
+
+    // Mock queryMap for error handling
+    QueryParamsMap queryParamsMap = mock(QueryParamsMap.class);
+    Map<String, String[]> queryMap = new HashMap<>(2);
+    queryMap.put(ControllerApiConstants.CLUSTER, new String[] { TEST_CLUSTER });
+    queryMap.put(ControllerApiConstants.STORE_NAME, new String[] { TEST_STORE_NAME });
+    doReturn(queryMap).when(queryParamsMap).toMap();
+    doReturn(queryParamsMap).when(request).queryMap();
+
+    ClusterStoreGrpcInfo storeInfo =
+        ClusterStoreGrpcInfo.newBuilder().setClusterName(TEST_CLUSTER).setStoreName(TEST_STORE_NAME).build();
+
+    Route validateStoreDeletedRoute =
+        new StoresRoutes(false, Optional.empty(), pubSubTopicRepository, mockRequestHandler)
+            .validateStoreDeleted(mockAdmin);
+
+    // Case 1: Store is deleted (storeDeleted=true, no reason)
+    ValidateStoreDeletedGrpcResponse deletedResponse =
+        ValidateStoreDeletedGrpcResponse.newBuilder().setStoreInfo(storeInfo).setStoreDeleted(true).build();
+    when(mockRequestHandler.validateStoreDeleted(any(ValidateStoreDeletedGrpcRequest.class)))
+        .thenReturn(deletedResponse);
+
+    StoreDeletedValidationResponse response = ObjectMapperFactory.getInstance()
+        .readValue(
+            validateStoreDeletedRoute.handle(request, mock(Response.class)).toString(),
+            StoreDeletedValidationResponse.class);
+    Assert.assertFalse(response.isError());
+    Assert.assertEquals(response.getCluster(), TEST_CLUSTER);
+    Assert.assertEquals(response.getName(), TEST_STORE_NAME);
+    Assert.assertTrue(response.isStoreDeleted());
+    Assert.assertNull(response.getReason());
+
+    // Case 2: Store is not deleted (storeDeleted=false, with reason)
+    String reason = "Store config still exists in ZooKeeper";
+    ValidateStoreDeletedGrpcResponse notDeletedResponse = ValidateStoreDeletedGrpcResponse.newBuilder()
+        .setStoreInfo(storeInfo)
+        .setStoreDeleted(false)
+        .setReason(reason)
+        .build();
+    when(mockRequestHandler.validateStoreDeleted(any(ValidateStoreDeletedGrpcRequest.class)))
+        .thenReturn(notDeletedResponse);
+
+    response = ObjectMapperFactory.getInstance()
+        .readValue(
+            validateStoreDeletedRoute.handle(request, mock(Response.class)).toString(),
+            StoreDeletedValidationResponse.class);
+    Assert.assertFalse(response.isError());
+    Assert.assertEquals(response.getCluster(), TEST_CLUSTER);
+    Assert.assertEquals(response.getName(), TEST_STORE_NAME);
+    Assert.assertFalse(response.isStoreDeleted());
+    Assert.assertEquals(response.getReason(), reason);
+
+    // Case 3: Store is not deleted without reason (edge case)
+    ValidateStoreDeletedGrpcResponse notDeletedNoReasonResponse =
+        ValidateStoreDeletedGrpcResponse.newBuilder().setStoreInfo(storeInfo).setStoreDeleted(false).build();
+    when(mockRequestHandler.validateStoreDeleted(any(ValidateStoreDeletedGrpcRequest.class)))
+        .thenReturn(notDeletedNoReasonResponse);
+
+    response = ObjectMapperFactory.getInstance()
+        .readValue(
+            validateStoreDeletedRoute.handle(request, mock(Response.class)).toString(),
+            StoreDeletedValidationResponse.class);
+    Assert.assertFalse(response.isError());
+    Assert.assertFalse(response.isStoreDeleted());
+    Assert.assertNull(response.getReason());
+
+    // Case 4: Handler throws exception
+    String errorMessage = "Failed to validate store deletion";
+    when(mockRequestHandler.validateStoreDeleted(any(ValidateStoreDeletedGrpcRequest.class)))
+        .thenThrow(new VeniceException(errorMessage));
+
+    response = ObjectMapperFactory.getInstance()
+        .readValue(
+            validateStoreDeletedRoute.handle(request, mock(Response.class)).toString(),
+            StoreDeletedValidationResponse.class);
+    Assert.assertTrue(response.isError());
+    Assert.assertTrue(response.getError().contains(errorMessage));
+  }
+
+  @Test
+  public void testGetAllStoresWithHandler() throws Exception {
+    Admin mockAdmin = mock(VeniceParentHelixAdmin.class);
+    StoreRequestHandler mockRequestHandler = mock(StoreRequestHandler.class);
+    doReturn(true).when(mockAdmin).isLeaderControllerFor(TEST_CLUSTER);
+
+    Request request = mock(Request.class);
+    doReturn(TEST_CLUSTER).when(request).queryParams(eq(ControllerApiConstants.CLUSTER));
+    doReturn(null).when(request).queryParams(eq(ControllerApiConstants.NAME));
+    doReturn(null).when(request).queryParams(eq(ControllerApiConstants.INCLUDE_SYSTEM_STORES));
+    doReturn(null).when(request).queryParamOrDefault(eq(ControllerApiConstants.STORE_CONFIG_NAME_FILTER), any());
+    doReturn(null).when(request).queryParamOrDefault(eq(ControllerApiConstants.STORE_CONFIG_VALUE_FILTER), any());
+
+    // Mock queryMap for error handling
+    QueryParamsMap queryParamsMap = mock(QueryParamsMap.class);
+    Map<String, String[]> queryMap = new HashMap<>(1);
+    queryMap.put(ControllerApiConstants.CLUSTER, new String[] { TEST_CLUSTER });
+    doReturn(queryMap).when(queryParamsMap).toMap();
+    doReturn(queryParamsMap).when(request).queryMap();
+
+    // Case 1: Success response with multiple stores
+    ListStoresGrpcResponse grpcResponse = ListStoresGrpcResponse.newBuilder()
+        .setClusterName(TEST_CLUSTER)
+        .addStoreNames("store1")
+        .addStoreNames("store2")
+        .addStoreNames("store3")
+        .build();
+    when(mockRequestHandler.listStores(any(ListStoresGrpcRequest.class))).thenReturn(grpcResponse);
+
+    Route getAllStoresRoute =
+        new StoresRoutes(false, Optional.empty(), pubSubTopicRepository, mockRequestHandler).getAllStores(mockAdmin);
+    MultiStoreResponse response = ObjectMapperFactory.getInstance()
+        .readValue(getAllStoresRoute.handle(request, mock(Response.class)).toString(), MultiStoreResponse.class);
+    Assert.assertFalse(response.isError());
+    Assert.assertEquals(response.getCluster(), TEST_CLUSTER);
+    Assert.assertEquals(response.getStores().length, 3);
+    Assert.assertEquals(response.getStores()[0], "store1");
+    Assert.assertEquals(response.getStores()[1], "store2");
+    Assert.assertEquals(response.getStores()[2], "store3");
+
+    // Case 2: Empty response
+    ListStoresGrpcResponse emptyResponse = ListStoresGrpcResponse.newBuilder().setClusterName(TEST_CLUSTER).build();
+    when(mockRequestHandler.listStores(any(ListStoresGrpcRequest.class))).thenReturn(emptyResponse);
+
+    response = ObjectMapperFactory.getInstance()
+        .readValue(getAllStoresRoute.handle(request, mock(Response.class)).toString(), MultiStoreResponse.class);
+    Assert.assertFalse(response.isError());
+    Assert.assertEquals(response.getStores().length, 0);
+
+    // Case 3: Handler throws exception
+    String errorMessage = "Failed to list stores";
+    when(mockRequestHandler.listStores(any(ListStoresGrpcRequest.class))).thenThrow(new VeniceException(errorMessage));
+
+    response = ObjectMapperFactory.getInstance()
+        .readValue(getAllStoresRoute.handle(request, mock(Response.class)).toString(), MultiStoreResponse.class);
+    Assert.assertTrue(response.isError());
+    Assert.assertTrue(response.getError().contains(errorMessage));
+  }
+
+  @Test
+  public void testGetAllStoresWithFilters() throws Exception {
+    Admin mockAdmin = mock(VeniceParentHelixAdmin.class);
+    StoreRequestHandler mockRequestHandler = mock(StoreRequestHandler.class);
+    doReturn(true).when(mockAdmin).isLeaderControllerFor(TEST_CLUSTER);
+
+    Request request = mock(Request.class);
+    doReturn(TEST_CLUSTER).when(request).queryParams(eq(ControllerApiConstants.CLUSTER));
+    doReturn(null).when(request).queryParams(eq(ControllerApiConstants.NAME));
+    doReturn("false").when(request).queryParams(eq(ControllerApiConstants.INCLUDE_SYSTEM_STORES));
+    doReturn(null).when(request).queryParamOrDefault(eq(ControllerApiConstants.STORE_CONFIG_NAME_FILTER), any());
+    doReturn(null).when(request).queryParamOrDefault(eq(ControllerApiConstants.STORE_CONFIG_VALUE_FILTER), any());
+
+    // Mock queryMap for error handling
+    QueryParamsMap queryParamsMap = mock(QueryParamsMap.class);
+    Map<String, String[]> queryMap = new HashMap<>(2);
+    queryMap.put(ControllerApiConstants.CLUSTER, new String[] { TEST_CLUSTER });
+    queryMap.put(ControllerApiConstants.INCLUDE_SYSTEM_STORES, new String[] { "false" });
+    doReturn(queryMap).when(queryParamsMap).toMap();
+    doReturn(queryParamsMap).when(request).queryMap();
+
+    ListStoresGrpcResponse grpcResponse =
+        ListStoresGrpcResponse.newBuilder().setClusterName(TEST_CLUSTER).addStoreNames("user-store").build();
+    when(mockRequestHandler.listStores(any(ListStoresGrpcRequest.class))).thenReturn(grpcResponse);
+
+    Route getAllStoresRoute =
+        new StoresRoutes(false, Optional.empty(), pubSubTopicRepository, mockRequestHandler).getAllStores(mockAdmin);
+    MultiStoreResponse response = ObjectMapperFactory.getInstance()
+        .readValue(getAllStoresRoute.handle(request, mock(Response.class)).toString(), MultiStoreResponse.class);
+    Assert.assertFalse(response.isError());
+    Assert.assertEquals(response.getStores().length, 1);
+    Assert.assertEquals(response.getStores()[0], "user-store");
+  }
+
+  @Test
+  public void testGetAllStoresStatuses() throws Exception {
+    Admin mockAdmin = mock(VeniceParentHelixAdmin.class);
+    StoreRequestHandler mockRequestHandler = mock(StoreRequestHandler.class);
+    doReturn(true).when(mockAdmin).isLeaderControllerFor(TEST_CLUSTER);
+
+    Request request = mock(Request.class);
+    doReturn(TEST_CLUSTER).when(request).queryParams(eq(ControllerApiConstants.CLUSTER));
+
+    // Mock queryMap for error handling
+    QueryParamsMap queryParamsMap = mock(QueryParamsMap.class);
+    Map<String, String[]> queryMap = new HashMap<>(1);
+    queryMap.put(ControllerApiConstants.CLUSTER, new String[] { TEST_CLUSTER });
+    doReturn(queryMap).when(queryParamsMap).toMap();
+    doReturn(queryParamsMap).when(request).queryMap();
+
+    Route getAllStoresStatusesRoute =
+        new StoresRoutes(false, Optional.empty(), pubSubTopicRepository, mockRequestHandler)
+            .getAllStoresStatuses(mockAdmin);
+
+    // Case 1: Success response with multiple stores and statuses
+    Map<String, String> storeStatusMap = new HashMap<>();
+    storeStatusMap.put("store1", "ONLINE");
+    storeStatusMap.put("store2", "DEGRADED");
+    storeStatusMap.put("store3", "UNAVAILABLE");
+    when(mockRequestHandler.getStoreStatuses(TEST_CLUSTER)).thenReturn(storeStatusMap);
+
+    MultiStoreStatusResponse response = ObjectMapperFactory.getInstance()
+        .readValue(
+            getAllStoresStatusesRoute.handle(request, mock(Response.class)).toString(),
+            MultiStoreStatusResponse.class);
+    Assert.assertFalse(response.isError());
+    Assert.assertEquals(response.getCluster(), TEST_CLUSTER);
+    Assert.assertEquals(response.getStoreStatusMap().size(), 3);
+    Assert.assertEquals(response.getStoreStatusMap().get("store1"), "ONLINE");
+    Assert.assertEquals(response.getStoreStatusMap().get("store2"), "DEGRADED");
+    Assert.assertEquals(response.getStoreStatusMap().get("store3"), "UNAVAILABLE");
+
+    // Case 2: Empty response
+    when(mockRequestHandler.getStoreStatuses(TEST_CLUSTER)).thenReturn(new HashMap<>());
+
+    response = ObjectMapperFactory.getInstance()
+        .readValue(
+            getAllStoresStatusesRoute.handle(request, mock(Response.class)).toString(),
+            MultiStoreStatusResponse.class);
+    Assert.assertFalse(response.isError());
+    Assert.assertEquals(response.getCluster(), TEST_CLUSTER);
+    Assert.assertTrue(response.getStoreStatusMap().isEmpty());
+
+    // Case 3: Handler throws exception
+    String errorMessage = "Failed to get store statuses";
+    when(mockRequestHandler.getStoreStatuses(TEST_CLUSTER)).thenThrow(new VeniceException(errorMessage));
+
+    response = ObjectMapperFactory.getInstance()
+        .readValue(
+            getAllStoresStatusesRoute.handle(request, mock(Response.class)).toString(),
+            MultiStoreStatusResponse.class);
+    Assert.assertTrue(response.isError());
+    Assert.assertTrue(response.getError().contains(errorMessage));
+  }
+
+  @Test
+  public void testGetRepushInfo() throws Exception {
+    Admin mockAdmin = mock(VeniceParentHelixAdmin.class);
+    StoreRequestHandler mockRequestHandler = mock(StoreRequestHandler.class);
+    doReturn(true).when(mockAdmin).isLeaderControllerFor(TEST_CLUSTER);
+
+    Request request = mock(Request.class);
+    doReturn(TEST_CLUSTER).when(request).queryParams(eq(ControllerApiConstants.CLUSTER));
+    doReturn(TEST_STORE_NAME).when(request).queryParams(eq(ControllerApiConstants.NAME));
+    doReturn("test-fabric").when(request).queryParams(eq(ControllerApiConstants.FABRIC));
+
+    // Mock queryMap for error handling
+    QueryParamsMap queryParamsMap = mock(QueryParamsMap.class);
+    Map<String, String[]> queryMap = new HashMap<>();
+    queryMap.put(ControllerApiConstants.CLUSTER, new String[] { TEST_CLUSTER });
+    queryMap.put(ControllerApiConstants.NAME, new String[] { TEST_STORE_NAME });
+    queryMap.put(ControllerApiConstants.FABRIC, new String[] { "test-fabric" });
+    doReturn(queryMap).when(queryParamsMap).toMap();
+    doReturn(queryParamsMap).when(request).queryMap();
+
+    Route route =
+        new StoresRoutes(false, Optional.empty(), pubSubTopicRepository, mockRequestHandler).getRepushInfo(mockAdmin);
+
+    // Create a real Version for admin.getRepushInfo() call to avoid Jackson serialization issues
+    Version version = new VersionImpl(TEST_STORE_NAME, 1, "test-push-job", 10);
+    version.setStatus(VersionStatus.ONLINE);
+    version.setReplicationFactor(3);
+
+    RepushInfo mockRepushInfo = RepushInfo.createRepushInfo(version, "kafka.broker:9092", "d2-service", "zk-host");
+
+    when(mockRequestHandler.getRepushInfo(any(), any(), any())).thenReturn(mockRepushInfo);
+
+    RepushInfoResponse response = ObjectMapperFactory.getInstance()
+        .readValue(route.handle(request, mock(Response.class)).toString(), RepushInfoResponse.class);
+
+    Assert.assertFalse(response.isError());
+    Assert.assertEquals(response.getCluster(), TEST_CLUSTER);
+    Assert.assertEquals(response.getName(), TEST_STORE_NAME);
+    Assert.assertNotNull(response.getRepushInfo());
+    Assert.assertEquals(response.getRepushInfo().getKafkaBrokerUrl(), "kafka.broker:9092");
+
+    // Test error case
+    when(mockRequestHandler.getRepushInfo(any(), any(), any())).thenThrow(new VeniceException("Error"));
+    response = ObjectMapperFactory.getInstance()
+        .readValue(route.handle(request, mock(Response.class)).toString(), RepushInfoResponse.class);
+    Assert.assertTrue(response.isError());
+  }
+
+  @Test
+  public void testGetRepushInfoWithoutFabric() throws Exception {
+    Admin mockAdmin = mock(VeniceParentHelixAdmin.class);
+    StoreRequestHandler mockRequestHandler = mock(StoreRequestHandler.class);
+    doReturn(true).when(mockAdmin).isLeaderControllerFor(TEST_CLUSTER);
+
+    Request request = mock(Request.class);
+    doReturn(TEST_CLUSTER).when(request).queryParams(eq(ControllerApiConstants.CLUSTER));
+    doReturn(TEST_STORE_NAME).when(request).queryParams(eq(ControllerApiConstants.NAME));
+    doReturn(null).when(request).queryParams(eq(ControllerApiConstants.FABRIC));
+
+    // Mock queryMap for error handling
+    QueryParamsMap queryParamsMap = mock(QueryParamsMap.class);
+    Map<String, String[]> queryMap = new HashMap<>();
+    queryMap.put(ControllerApiConstants.CLUSTER, new String[] { TEST_CLUSTER });
+    queryMap.put(ControllerApiConstants.NAME, new String[] { TEST_STORE_NAME });
+    doReturn(queryMap).when(queryParamsMap).toMap();
+    doReturn(queryParamsMap).when(request).queryMap();
+
+    Route route =
+        new StoresRoutes(false, Optional.empty(), pubSubTopicRepository, mockRequestHandler).getRepushInfo(mockAdmin);
+
+    RepushInfo mockRepushInfo = RepushInfo.createRepushInfo(null, "another.kafka:9092", null, null);
+
+    when(mockRequestHandler.getRepushInfo(any(), any(), any())).thenReturn(mockRepushInfo);
+
+    RepushInfoResponse response = ObjectMapperFactory.getInstance()
+        .readValue(route.handle(request, mock(Response.class)).toString(), RepushInfoResponse.class);
+
+    Assert.assertFalse(response.isError());
+    Assert.assertEquals(response.getRepushInfo().getKafkaBrokerUrl(), "another.kafka:9092");
   }
 }

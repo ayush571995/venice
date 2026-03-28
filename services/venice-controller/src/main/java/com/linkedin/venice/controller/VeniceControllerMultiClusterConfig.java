@@ -231,6 +231,10 @@ public class VeniceControllerMultiClusterConfig {
     return getCommonConfig().getBackupVersionCleanupSleepMs();
   }
 
+  public long getBackupVersionMinCleanupDelayMs() {
+    return getCommonConfig().getBackupVersionMinCleanupDelayMs();
+  }
+
   public long getDeferredVersionSwapSleepMs() {
     return getCommonConfig().getDeferredVersionSwapSleepMs();
   }
@@ -361,6 +365,10 @@ public class VeniceControllerMultiClusterConfig {
 
   public Set<String> getRepushCandidateFilterClassNames() {
     return getCommonConfig().getRepushCandidateFilterClassNames();
+  }
+
+  public Set<String> getRepushCandidateTriggerClassNames() {
+    return getCommonConfig().getRepushCandidateTriggerClassNames();
   }
 
   public VeniceProperties getRepushOrchestratorConfigs() {

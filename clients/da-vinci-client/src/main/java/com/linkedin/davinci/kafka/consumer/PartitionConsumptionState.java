@@ -5,6 +5,7 @@ import static java.util.concurrent.TimeUnit.MINUTES;
 import com.linkedin.davinci.compression.KeyUrnCompressor;
 import com.linkedin.davinci.compression.UrnDictV1;
 import com.linkedin.davinci.helix.LeaderFollowerPartitionStateModel;
+import com.linkedin.davinci.stats.ingestion.heartbeat.HeartbeatKey;
 import com.linkedin.davinci.utils.ByteArrayKey;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.kafka.protocol.GUID;
@@ -35,7 +36,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -94,7 +94,7 @@ public class PartitionConsumptionState {
    * getting caught up after a push.
    */
   private long lagCaughtUpTimeInMs;
-  private boolean completionReported;
+  private volatile boolean completionReported;
   private boolean isSubscribed;
   private boolean isDataRecoveryCompleted;
   private LeaderFollowerStateType leaderFollowerState;
@@ -125,6 +125,28 @@ public class PartitionConsumptionState {
    * details why we need latch for certain resources.
    */
   private final AtomicReference<LatchStatus> latchStatus = new AtomicReference<>(LatchStatus.NONE);
+
+  /**
+   * Tracks DoL state during STANDBY to LEADER transition. Null when not in transition or DoL not enabled.
+   *
+   * <p>Thread access patterns:
+   * <ul>
+   *   <li>State machine thread: calls setDolState(), getDolState(), clearDolState(), isDolComplete()</li>
+   *   <li>Producer callback thread: calls getDolState(), then setDolProduced() on the DolStamp</li>
+   *   <li>Drainer thread: calls getDolState(), then setDolConsumed() on the DolStamp</li>
+   * </ul>
+   *
+   * <p>Thread safety: The volatile reference ensures proper publication. The DolStamp's internal flags
+   * (dolProduced, dolConsumed) are also volatile. Since flags only transition one-way (false → true),
+   * stale reads are safe - they just delay completion detection until the next check.
+   */
+  private volatile DolStamp dolStamp = null;
+
+  /**
+   * The highest leadership term observed by this replica. Currently used only
+   * for troubleshooting. This will eventually become part of the durable state.
+   */
+  private volatile long highestLeadershipTerm = -1;
 
   /**
    * This future is completed in drainer thread after persisting the associated record and offset to DB.
@@ -184,7 +206,7 @@ public class PartitionConsumptionState {
    * because of the properties of the above operations the caller is guaranteed to get the latest value for a key either from
    * this map or from the DB.
    */
-  private final ConcurrentMap<ByteArrayKey, TransientRecord> transientRecordMap = new VeniceConcurrentHashMap<>();
+  private final Map<ByteArrayKey, TransientRecord> transientRecordMap = new VeniceConcurrentHashMap<>();
 
   /**
    * This field is used to track whether the last queued record has been fully processed or not.
@@ -216,7 +238,7 @@ public class PartitionConsumptionState {
    * Key: source PubSub broker address
    * Value: latest consumed real-time topic position from that source
    */
-  private final ConcurrentMap<String, PubSubPosition> latestConsumedRtPositions;
+  private final Map<String, PubSubPosition> latestConsumedRtPositions;
 
   /**
    * Tracks the last real-time topic position consumed from each upstream broker
@@ -230,7 +252,7 @@ public class PartitionConsumptionState {
    * Key: source PubSub broker address
    * Value: last consumed real-time topic position with valid DIV
    */
-  private final ConcurrentMap<String, PubSubPosition> divRtCheckpointPositions;
+  private final Map<String, PubSubPosition> divRtCheckpointPositions;
 
   /**
    * Tracks the position of the last local version topic record processed
@@ -280,6 +302,36 @@ public class PartitionConsumptionState {
    */
   private boolean hasResubscribedAfterBootstrapAsCurrentVersion;
 
+  /**
+   * Tracks an in-progress blob transfer for this partition. When non-null, blob transfer is in progress
+   * and Kafka subscribe has not yet happened. The SIT main loop's checkLongRunningTaskState() will poll
+   * this future for completion and then perform Kafka subscribe.
+   *
+   * Set during SUBSCRIBE action processing when blob transfer is needed.
+   * Cleared when blob transfer completes (success or failure) or when UNSUBSCRIBE cancels it.
+   */
+  private volatile CompletableFuture<Void> pendingBlobTransfer;
+
+  /**
+   * Tracks an in-progress record transformer recovery after blob transfer completes.
+   * Set when blob transfer finishes and record transformer recovery is submitted to the thread pool.
+   * Cleared when record transformer recovery completes and Kafka subscribe proceeds.
+   */
+  private volatile CompletableFuture<Void> pendingRecordTransformerRecovery;
+
+  /**
+   * The original consumer action that triggered the record transformer recovery, if any.
+   * Stored so that checkLongRunningTaskState can pass it to validateAndSubscribePartition
+   * when the record transformer future completes. Null for the post-blob-transfer path.
+   */
+  private volatile ConsumerAction postRecordTransformerConsumerAction;
+
+  /**
+   * Cached HeartbeatKey references keyed by region, populated during lag monitor setup.
+   * Eliminates HeartbeatKey creation and hash computation on the per-record recording path.
+   */
+  private final Map<String, HeartbeatKey> cachedHeartbeatKeys;
+
   public PartitionConsumptionState(
       PubSubTopicPartition partitionReplica,
       OffsetRecord offsetRecord,
@@ -316,15 +368,25 @@ public class PartitionConsumptionState {
     this.consumptionStartTimeInMs = currentTimeInMs;
 
     // Restore in-memory consumption RT positions and latest processed RT
-    // positions from the checkpoint upstream positions map
-    latestConsumedRtPositions = new VeniceConcurrentHashMap<>(3);
-    divRtCheckpointPositions = new VeniceConcurrentHashMap<>(3);
-    latestProcessedRtPositions = new VeniceConcurrentHashMap<>(3);
-    trackingIncrementalPushStatus = new VeniceConcurrentHashMap<>(3);
-    if (offsetRecord.getLeaderTopic() != null && Version.isRealTimeTopic(offsetRecord.getLeaderTopic())) {
-      offsetRecord.cloneRtPositionCheckpoints(latestConsumedRtPositions);
-      offsetRecord.cloneRtPositionCheckpoints(latestProcessedRtPositions);
+    // positions from the checkpoint upstream positions map.
+    // Batch-only stores never consume from RT topics, so skip allocating
+    // these maps to reduce per-partition heap overhead.
+    if (hybrid) {
+      latestConsumedRtPositions = new VeniceConcurrentHashMap<>(3);
+      divRtCheckpointPositions = new VeniceConcurrentHashMap<>(3);
+      latestProcessedRtPositions = new VeniceConcurrentHashMap<>(3);
+      if (offsetRecord.getLeaderTopic() != null && Version.isRealTimeTopic(offsetRecord.getLeaderTopic())) {
+        offsetRecord.cloneRtPositionCheckpoints(latestConsumedRtPositions);
+        offsetRecord.cloneRtPositionCheckpoints(latestProcessedRtPositions);
+      }
+      trackingIncrementalPushStatus = new VeniceConcurrentHashMap<>(3);
+    } else {
+      latestConsumedRtPositions = Collections.emptyMap();
+      divRtCheckpointPositions = Collections.emptyMap();
+      latestProcessedRtPositions = Collections.emptyMap();
+      trackingIncrementalPushStatus = Collections.emptyMap();
     }
+    cachedHeartbeatKeys = new VeniceConcurrentHashMap<>(3);
     // Restore in-memory latest consumed version topic position and leader info from the checkpoint version topic
     // position
     this.latestProcessedVtPosition = offsetRecord.getCheckpointedLocalVtPosition();
@@ -365,6 +427,38 @@ public class PartitionConsumptionState {
 
   public void setCurrentVersionSupplier(BooleanSupplier isCurrentVersion) {
     this.isCurrentVersion = isCurrentVersion;
+  }
+
+  public CompletableFuture<Void> getPendingBlobTransfer() {
+    return this.pendingBlobTransfer;
+  }
+
+  public void setPendingBlobTransfer(CompletableFuture<Void> pendingBlobTransfer) {
+    this.pendingBlobTransfer = pendingBlobTransfer;
+  }
+
+  public boolean isBlobTransferInProgress() {
+    return this.pendingBlobTransfer != null;
+  }
+
+  public CompletableFuture<Void> getPendingRecordTransformerRecovery() {
+    return this.pendingRecordTransformerRecovery;
+  }
+
+  public void setPendingRecordTransformerRecovery(CompletableFuture<Void> pendingRecordTransformerRecovery) {
+    this.pendingRecordTransformerRecovery = pendingRecordTransformerRecovery;
+  }
+
+  public boolean isRecordTransformerRecoveryInProgress() {
+    return this.pendingRecordTransformerRecovery != null;
+  }
+
+  public ConsumerAction getPostRecordTransformerConsumerAction() {
+    return this.postRecordTransformerConsumerAction;
+  }
+
+  public void setPostRecordTransformerConsumerAction(ConsumerAction postRecordTransformerConsumerAction) {
+    this.postRecordTransformerConsumerAction = postRecordTransformerConsumerAction;
   }
 
   public OffsetRecord getOffsetRecord() {
@@ -520,6 +614,26 @@ public class PartitionConsumptionState {
 
   public final LeaderFollowerStateType getLeaderFollowerState() {
     return this.leaderFollowerState;
+  }
+
+  public DolStamp getDolState() {
+    return this.dolStamp;
+  }
+
+  public void setDolState(DolStamp dolStamp) {
+    this.dolStamp = dolStamp;
+  }
+
+  public void clearDolState() {
+    this.dolStamp = null;
+  }
+
+  public long getHighestLeadershipTerm() {
+    return highestLeadershipTerm;
+  }
+
+  public void setHighestLeadershipTerm(long term) {
+    this.highestLeadershipTerm = term;
   }
 
   public void setLastLeaderPersistFuture(Future<Void> future) {
@@ -873,6 +987,8 @@ public class PartitionConsumptionState {
    * @return the current upstream version topic position
    */
   public PubSubPosition getLatestProcessedRemoteVtPosition() {
+    // TODO: Ideally, we should get this from offset record to ensure durability
+    // return this.offsetRecord.getCheckpointedRemoteVtPosition();
     return this.latestProcessedRemoteVtPosition;
   }
 
@@ -1132,5 +1248,18 @@ public class PartitionConsumptionState {
 
   public void setHasResubscribedAfterBootstrapAsCurrentVersion(boolean hasResubscribedAfterBootstrapAsCurrentVersion) {
     this.hasResubscribedAfterBootstrapAsCurrentVersion = hasResubscribedAfterBootstrapAsCurrentVersion;
+  }
+
+  /**
+   * Get or create a cached HeartbeatKey for the given region.
+   * Derives storeName/version from the partition replica topic name.
+   */
+  public HeartbeatKey getOrCreateCachedHeartbeatKey(String region) {
+    return cachedHeartbeatKeys.computeIfAbsent(region, r -> {
+      String topicName = partitionReplica.getTopicName();
+      String storeName = Version.parseStoreFromKafkaTopicName(topicName);
+      int version = Version.parseVersionFromKafkaTopicName(topicName);
+      return new HeartbeatKey(storeName, version, getPartition(), r);
+    });
   }
 }

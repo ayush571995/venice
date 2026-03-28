@@ -1,5 +1,7 @@
 package com.linkedin.venice.listener;
 
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.atLeastOnce;
@@ -12,6 +14,7 @@ import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertTrue;
 
 import com.linkedin.davinci.config.VeniceServerConfig;
+import com.linkedin.davinci.storage.StorageEngineRepository;
 import com.linkedin.venice.helix.HelixCustomizedViewOfflinePushRepository;
 import com.linkedin.venice.meta.Instance;
 import com.linkedin.venice.meta.OfflinePushStrategy;
@@ -49,6 +52,7 @@ import org.testng.annotations.Test;
 public class ReadQuotaEnforcementHandlerListenerTest {
   private String nodeId = "thisNodeId";
   private VeniceServerConfig serverConfig;
+  private StorageEngineRepository storageEngineRepository;
 
   @BeforeMethod
   public void setUp() {
@@ -56,6 +60,7 @@ public class ReadQuotaEnforcementHandlerListenerTest {
     when(serverConfig.getNodeCapacityInRcu()).thenReturn(100L);
     when(serverConfig.getQuotaEnforcementIntervalInMs()).thenReturn(1000);
     when(serverConfig.getQuotaEnforcementCapacityMultiple()).thenReturn(1);
+    storageEngineRepository = mock(StorageEngineRepository.class);
   }
 
   @Test
@@ -75,6 +80,7 @@ public class ReadQuotaEnforcementHandlerListenerTest {
         serverConfig,
         storeRepository,
         CompletableFuture.completedFuture(customizedViewRepository),
+        storageEngineRepository,
         nodeId,
         stats);
     TestUtils.waitForNonDeterministicAssertion(10, TimeUnit.SECONDS, () -> Assert.assertFalse(listeners.isEmpty()));
@@ -116,6 +122,7 @@ public class ReadQuotaEnforcementHandlerListenerTest {
         serverConfig,
         storeRepository,
         CompletableFuture.completedFuture(customizedViewRepository),
+        storageEngineRepository,
         nodeId,
         stats);
 
@@ -155,7 +162,7 @@ public class ReadQuotaEnforcementHandlerListenerTest {
     store2.setCurrentVersion(4);
     quotaEnforcer.handleStoreChanged(store2);
     verify(storeStats2, atLeastOnce()).removeVersion(2);
-    verify(stats, atLeastOnce()).setCurrentVersion("store2", 4);
+    verify(stats, atLeastOnce()).updateVersionInfo(eq("store2"), eq(4), anyInt());
     assertTrue(
         registeredTopics.contains(Version.composeKafkaTopic(store2.getName(), 4)),
         "After adding a store with version " + 4 + ", the throttler should be subscribed to updates for that topic");

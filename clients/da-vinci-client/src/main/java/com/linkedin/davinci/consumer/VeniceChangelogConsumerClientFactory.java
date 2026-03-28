@@ -21,7 +21,6 @@ import com.linkedin.venice.serialization.avro.OptimizedKafkaValueSerializer;
 import com.linkedin.venice.utils.VeniceProperties;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import com.linkedin.venice.utils.pools.LandFillObjectPool;
-import com.linkedin.venice.views.ChangeCaptureView;
 import io.tehuti.metrics.MetricsRepository;
 import java.util.Map;
 import java.util.Objects;
@@ -114,18 +113,6 @@ public class VeniceChangelogConsumerClientFactory {
       String viewClass = getViewClass(newStoreChangelogClientConfig, storeName);
       String consumerName =
           suffixConsumerIdToStore(storeName + "-" + viewClass.getClass().getSimpleName(), adjustedConsumerId);
-      if (viewClass.equals(ChangeCaptureView.class.getCanonicalName())) {
-        // TODO: This is a little bit of a hack. This is to deal with the an issue where the before image change
-        // capture topic doesn't follow the same naming convention as view topics.
-        newStoreChangelogClientConfig.setIsBeforeImageView(true);
-        return new VeniceChangelogConsumerImpl(
-            newStoreChangelogClientConfig,
-            consumer != null
-                ? consumer
-                : getPubSubConsumer(newStoreChangelogClientConfig, pubSubMessageDeserializer, consumerName),
-            pubSubMessageDeserializer,
-            this);
-      }
 
       if (globalChangelogClientConfig.isNewStatelessClientEnabled()) {
         return new VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>(newStoreChangelogClientConfig, this);
@@ -181,16 +168,27 @@ public class VeniceChangelogConsumerClientFactory {
   /**
    * Subscribes to a specific version of a Venice store. This is only intended for internal use.
    */
-  public <K, V> VeniceChangelogConsumer<K, V> getVersionSpecificChangelogConsumer(String storeName, int storeVersion) {
+  public <K, V> VeniceChangelogConsumer<K, V> getVersionSpecificChangelogConsumer(
+      String storeName,
+      int storeVersion,
+      boolean includeControlMessages) {
     String consumerName = storeName + "v_" + storeVersion;
     return versionSpecificStoreClientMap.computeIfAbsent(consumerName, name -> {
       ChangelogClientConfig newStoreChangelogClientConfig =
           getNewStoreChangelogClientConfig(storeName).setStoreVersion(storeVersion)
               .setIsStateful(false)
-              .setConsumerName(consumerName);
+              .setConsumerName(consumerName)
+              .setIncludeControlMessages(includeControlMessages);
 
       return new VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>(newStoreChangelogClientConfig, this);
     });
+  }
+
+  /**
+   * Creates a version specific changelog consumer without control messages.
+   */
+  public <K, V> VeniceChangelogConsumer<K, V> getVersionSpecificChangelogConsumer(String storeName, int storeVersion) {
+    return getVersionSpecificChangelogConsumer(storeName, storeVersion, false);
   }
 
   private ChangelogClientConfig getNewStoreChangelogClientConfig(String storeName) {
@@ -266,6 +264,8 @@ public class VeniceChangelogConsumerClientFactory {
     VeniceProperties properties = new VeniceProperties(changelogClientConfig.getConsumerProperties());
     D2Client d2Client = changelogClientConfig.getD2Client();
     boolean kmeEnabled = properties.getBoolean(ConfigKeys.KME_SCHEMA_READER_FOR_SCHEMA_EVOLUTION_ENABLED, true);
+    boolean producerTimestampFallbackEnabled =
+        properties.getBoolean(ConfigKeys.PUBSUB_PRODUCER_TIMESTAMP_FALLBACK_ENABLED, true);
 
     if (kmeEnabled && d2Client != null) {
       LOGGER.info("Creating KME reader backed PubSubMessageDeserializer");
@@ -278,7 +278,8 @@ public class VeniceChangelogConsumerClientFactory {
       return new PubSubMessageDeserializer(
           kafkaValueSerializer,
           new LandFillObjectPool<>(KafkaMessageEnvelope::new),
-          new LandFillObjectPool<>(KafkaMessageEnvelope::new));
+          new LandFillObjectPool<>(KafkaMessageEnvelope::new),
+          producerTimestampFallbackEnabled);
     }
 
     LOGGER.info(
@@ -286,7 +287,11 @@ public class VeniceChangelogConsumerClientFactory {
         kmeEnabled,
         d2Client != null);
     // Safe default when KME is disabled or D2 is unavailable.
-    return PubSubMessageDeserializer.createDefaultDeserializer();
+    return new PubSubMessageDeserializer(
+        new KafkaValueSerializer(),
+        new LandFillObjectPool<>(KafkaMessageEnvelope::new),
+        new LandFillObjectPool<>(KafkaMessageEnvelope::new),
+        producerTimestampFallbackEnabled);
   }
 
   private String getViewClass(String storeName, String viewName, D2ControllerClient d2ControllerClient, int retries) {

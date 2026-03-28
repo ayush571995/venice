@@ -13,6 +13,7 @@ import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.exceptions.VeniceNoClusterException;
 import com.linkedin.venice.hooks.StoreLifecycleHooks;
 import com.linkedin.venice.hooks.StoreVersionLifecycleEventOutcome;
+import com.linkedin.venice.meta.ConcurrentPushDetectionStrategy;
 import com.linkedin.venice.meta.LifecycleHooksRecord;
 import com.linkedin.venice.meta.ReadWriteStoreRepository;
 import com.linkedin.venice.meta.Store;
@@ -69,8 +70,7 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
   private final AtomicBoolean stop = new AtomicBoolean(false);
   private final VeniceControllerMultiClusterConfig veniceControllerMultiClusterConfig;
   private final VeniceParentHelixAdmin veniceParentHelixAdmin;
-  private final ScheduledExecutorService deferredVersionSwapExecutor =
-      Executors.newSingleThreadScheduledExecutor(new DaemonThreadFactory(getClass().getSimpleName()));
+  private final ScheduledExecutorService deferredVersionSwapExecutor;
   private final DeferredVersionSwapStats deferredVersionSwapStats;
   private static final RedundantExceptionFilter REDUNDANT_EXCEPTION_FILTER =
       new RedundantExceptionFilter(RedundantExceptionFilter.DEFAULT_BITSET_SIZE, TimeUnit.MINUTES.toMillis(10));
@@ -102,6 +102,8 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
       MetricsRepository metricsRepository) {
     this.veniceParentHelixAdmin = admin;
     this.veniceControllerMultiClusterConfig = multiClusterConfig;
+    this.deferredVersionSwapExecutor = Executors.newSingleThreadScheduledExecutor(
+        new DaemonThreadFactory(getClass().getSimpleName(), multiClusterConfig.getLogContext()));
     this.deferredVersionSwapStats = deferredVersionSwapStats;
     this.metricsRepository = metricsRepository;
   }
@@ -145,7 +147,9 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
       int threadPoolSize =
           veniceControllerMultiClusterConfig.getControllerConfig(cluster).getDeferredVersionSwapThreadPoolSize();
 
-      DaemonThreadFactory threadFactory = new DaemonThreadFactory(cluster + "-deferred-version-swap");
+      DaemonThreadFactory threadFactory = new DaemonThreadFactory(
+          cluster + "-deferred-version-swap",
+          veniceControllerMultiClusterConfig.getLogContext());
       ThreadPoolExecutor executor = (ThreadPoolExecutor) Executors.newFixedThreadPool(threadPoolSize, threadFactory);
       String statsName = "DeferredVersionSwap-" + cluster;
       ThreadPoolStats threadPoolStats = new ThreadPoolStats(metricsRepository, executor, statsName);
@@ -259,6 +263,9 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
       return null;
     }
 
+    logMessageIfNotRedundant(
+        "Got version " + targetVersionNum + " with status " + version.get().getStatus() + " for store: " + storeName
+            + " in region " + region);
     return version.get();
   }
 
@@ -283,7 +290,7 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
 
     if (stalledVersionSwapSet.contains(storeName)) {
       stalledVersionSwapSet.remove(storeName);
-      deferredVersionSwapStats.recordDeferredVersionSwapStalledVersionSwapSensor(stalledVersionSwapSet.size());
+      deferredVersionSwapStats.recordDeferredVersionSwapStalledVersionSwapMetric(stalledVersionSwapSet.size());
     }
 
     // Update parent version status after roll forward, so we don't check this store version again
@@ -371,7 +378,7 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
           VERSION_SWAP_COMPLETION_STATUSES);
       if (didPushCompleteInNonTargetRegions) {
         stalledVersionSwapSet.remove(storeName);
-        deferredVersionSwapStats.recordDeferredVersionSwapStalledVersionSwapSensor(stalledVersionSwapSet.size());
+        deferredVersionSwapStats.recordDeferredVersionSwapStalledVersionSwapMetric(stalledVersionSwapSet.size());
       }
     }
 
@@ -386,7 +393,7 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
             targetVersion.getNumber(),
             TERMINAL_PUSH_VERSION_STATUSES);
         if (didPushCompleteInTargetRegions) {
-          deferredVersionSwapStats.recordDeferredVersionSwapParentChildStatusMismatchSensor();
+          deferredVersionSwapStats.recordDeferredVersionSwapParentChildStatusMismatchMetric(clusterName, storeName);
           String message =
               "Push completed in target regions, parent status is still STARTED. Continuing with deferred swap for store: "
                   + storeName + " for version: " + targetVersionNum;
@@ -408,7 +415,7 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
             VERSION_SWAP_COMPLETION_STATUSES);
 
         if (!didVersionSwapCompleteInNonTargetRegions) {
-          deferredVersionSwapStats.recordDeferredVersionSwapParentChildStatusMismatchSensor();
+          deferredVersionSwapStats.recordDeferredVersionSwapParentChildStatusMismatchMetric(clusterName, storeName);
           String message =
               "Parent status is already ONLINE, but version swap has not happened in the non target regions. "
                   + "Continuing with deferred swap for store: " + storeName + " for version: " + targetVersionNum;
@@ -417,6 +424,9 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
         }
     }
 
+    logMessageIfNotRedundant(
+        "Skipping store " + storeName + " as parent version " + targetVersionNum + " status is "
+            + targetVersion.getStatus());
     return false;
   }
 
@@ -491,7 +501,8 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
       String targetRegion,
       Store store,
       int targetVersionNum,
-      Version parentVersion) {
+      Version parentVersion,
+      String clusterName) {
     if (parentVersion.getStatus().equals(ONLINE) || parentVersion.getStatus().equals(ERROR)
         || parentVersion.getStatus().equals(PARTIALLY_ONLINE)) {
       return;
@@ -518,7 +529,7 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
           + targetRegion;
       logMessageIfNotRedundant(message);
       stalledVersionSwapSet.add(store.getName());
-      deferredVersionSwapStats.recordDeferredVersionSwapStalledVersionSwapSensor(stalledVersionSwapSet.size());
+      deferredVersionSwapStats.recordDeferredVersionSwapStalledVersionSwapMetric(stalledVersionSwapSet.size());
     }
   }
 
@@ -560,7 +571,7 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
           + " and the wait time: " + parentStore.getTargetSwapRegionWaitTime() + " has passed in region " + region;
       logMessageIfNotRedundant(message);
       stalledVersionSwapSet.add(parentStore.getName());
-      deferredVersionSwapStats.recordDeferredVersionSwapStalledVersionSwapSensor(stalledVersionSwapSet.size());
+      deferredVersionSwapStats.recordDeferredVersionSwapStalledVersionSwapMetric(stalledVersionSwapSet.size());
     }
   }
 
@@ -646,7 +657,7 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
           nextEligibleRegion);
       return null;
     } else if (VersionStatus.ONLINE.equals(version.getStatus())
-        && rolloutOrder.get(rolloutOrder.size() - 1).equals(nextEligibleRegion)) {
+        && regionToCurrentVersion.get(nextEligibleRegion) < targetVersionNum) {
       String message = "Continuing to roll forward" + kafkaTopicName + " because region " + nextEligibleRegion
           + " is ONLINE, " + "but the current version" + regionToCurrentVersion.get(nextEligibleRegion)
           + " is not the target version " + targetVersionNum;
@@ -654,6 +665,9 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
       return nextEligibleRegion;
     }
 
+    logMessageIfNotRedundant(
+        "Did not find next eligble region to roll forward in for " + kafkaTopicName + " for version " + targetVersionNum
+            + " and status " + version.getStatus());
     return null;
   }
 
@@ -749,7 +763,8 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
               + childStore.getCurrentVersion() + " for store " + parentStore.getName() + " in region "
               + nonTargetRegion;
           logMessageIfNotRedundant(message);
-          deferredVersionSwapStats.recordDeferredVersionSwapChildStatusMismatchSensor();
+          deferredVersionSwapStats
+              .recordDeferredVersionSwapChildStatusMismatchMetric(clusterName, parentStore.getName());
         } else {
           onlineNonTargetRegions.add(nonTargetRegion);
         }
@@ -872,7 +887,7 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
     });
 
     if (attemptedRetries == MAX_ROLL_FORWARD_RETRY_LIMIT) {
-      deferredVersionSwapStats.recordDeferredVersionSwapFailedRollForwardSensor();
+      deferredVersionSwapStats.recordDeferredVersionSwapFailedRollForwardMetric(clusterName, parentStore.getName());
       updateStore(clusterName, parentStore.getName(), PARTIALLY_ONLINE, targetVersionNum);
       failedRollforwardRetryCountMap.remove(kafkaTopicName);
       LOGGER.info(
@@ -916,6 +931,7 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
    * Marks a store as no longer being processed.
    */
   private void finishProcessingStore(String kafkaTopicName) {
+    logMessageIfNotRedundant("Finished processing store " + kafkaTopicName);
     storesBeingProcessed.remove(kafkaTopicName);
   }
 
@@ -926,8 +942,8 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
         return;
       }
 
-      try {
-        for (String cluster: veniceParentHelixAdmin.getClustersLeaderOf()) {
+      for (String cluster: veniceParentHelixAdmin.getClustersLeaderOf()) {
+        try {
           if (!veniceParentHelixAdmin.isLeaderControllerFor(cluster)) {
             continue;
           }
@@ -961,6 +977,7 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
 
           boolean sequentialRollForward = !StringUtils.isEmpty(rolloutOrderStr);
           for (Store parentStore: eligibleStoresToProcess) {
+            LOGGER.debug("Processing version swap of store: {}", parentStore);
             Version targetVersion = parentStore.getVersion(parentStore.getLargestUsedVersionNumber());
 
             // Check if store is already being processed
@@ -975,6 +992,7 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
             clusterExecutorService.submit(() -> {
               try {
                 if (sequentialRollForward) {
+                  logMessageIfNotRedundant("Submitting sequential roll forward for store: " + parentStore.getName());
                   performSequentialRollForward(
                       cluster,
                       parentStore,
@@ -989,14 +1007,14 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
               }
             });
           }
-          clusterThreadPoolStats.recordQueuedTasksCount(clusterExecutorService.getQueue().size());
+          clusterThreadPoolStats.recordQueuedTasksCount();
+        } catch (Exception e) {
+          LOGGER.warn("Caught exception while performing deferred version swap for cluster: {}", cluster, e);
+          deferredVersionSwapStats.recordDeferredVersionSwapExceptionMetric(cluster);
+        } catch (Throwable throwable) {
+          LOGGER.warn("Caught a throwable while performing deferred version swap for cluster: {}", cluster, throwable);
+          deferredVersionSwapStats.recordDeferredVersionSwapThrowableMetric(cluster);
         }
-      } catch (Exception e) {
-        LOGGER.warn("Caught exception while performing deferred version swap", e);
-        deferredVersionSwapStats.recordDeferredVersionSwapErrorSensor();
-      } catch (Throwable throwable) {
-        LOGGER.warn("Caught a throwable while performing deferred version swap", throwable);
-        deferredVersionSwapStats.recordDeferredVersionSwapThrowableSensor();
       }
     };
   }
@@ -1179,7 +1197,8 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
         targetRegion,
         parentStore,
         targetVersionNum,
-        targetVersion);
+        targetVersion,
+        cluster);
 
     if (!didPostVersionSwapValidationsPass(
         parentStore,
@@ -1225,7 +1244,10 @@ public class DeferredVersionSwapService extends AbstractVeniceService {
         // For jobs that stop polling early or for pushes that don't poll (empty push), we need to truncate the parent
         // VT here to unblock the next push
         String kafkaTopicName = Version.composeKafkaTopic(storeName, targetVersionNum);
-        if (!veniceParentHelixAdmin.isTopicTruncated(kafkaTopicName)) {
+        ConcurrentPushDetectionStrategy strategy =
+            veniceControllerMultiClusterConfig.getControllerConfig(clusterName).getConcurrentPushDetectionStrategy();
+        // skip truncating if the topic was not created based on ConcurrentPushDetectionStrategy
+        if (strategy.isTopicWriteNeeded() && !veniceParentHelixAdmin.isTopicTruncated(kafkaTopicName)) {
           LOGGER.info("Truncating parent VT for {}", kafkaTopicName);
           veniceParentHelixAdmin.truncateKafkaTopic(Version.composeKafkaTopic(storeName, targetVersionNum));
         }

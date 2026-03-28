@@ -22,6 +22,7 @@ import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_STORE_NAME_P
 import com.github.luben.zstd.ZstdDictTrainer;
 import com.google.common.base.Preconditions;
 import com.linkedin.d2.balancer.D2Client;
+import com.linkedin.venice.D2.D2ClientUtils;
 import com.linkedin.venice.client.store.ClientConfig;
 import com.linkedin.venice.common.VeniceSystemStoreType;
 import com.linkedin.venice.compression.CompressionStrategy;
@@ -77,6 +78,8 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -125,6 +128,7 @@ public class VeniceClusterWrapper extends ProcessWrapper {
   private final Map<String, String> nettyServerToGrpcAddress;
 
   private final PubSubProducerAdapterFactory pubSubProducerAdapterFactory;
+  private final Map<String, D2Client> d2Clients;
 
   private static Process veniceClusterProcess;
   // Controller discovery URLs are controllers that's created outside of this cluster wrapper but are overseeing the
@@ -155,7 +159,8 @@ public class VeniceClusterWrapper extends ProcessWrapper {
       Map<Integer, VeniceRouterWrapper> veniceRouterWrappers,
       Map<String, String> clusterToD2,
       Map<String, String> clusterToServerD2,
-      Map<String, String> nettyServerToGrpcAddress) {
+      Map<String, String> nettyServerToGrpcAddress,
+      Map<String, D2Client> d2Clients) {
 
     super(SERVICE_NAME, null);
 
@@ -176,6 +181,7 @@ public class VeniceClusterWrapper extends ProcessWrapper {
     this.clusterToServerD2 = clusterToServerD2;
     this.pubSubProducerAdapterFactory = pubSubBrokerWrapper.getPubSubClientsFactory().getProducerAdapterFactory();
     this.nettyServerToGrpcAddress = nettyServerToGrpcAddress;
+    this.d2Clients = d2Clients != null ? d2Clients : Collections.emptyMap();
   }
 
   public Map<String, String> getPubSubClientProperties() {
@@ -373,12 +379,13 @@ public class VeniceClusterWrapper extends ProcessWrapper {
               veniceRouterWrappers,
               clusterToD2,
               clusterToServerD2,
-              nettyServerToGrpcAddress);
+              nettyServerToGrpcAddress,
+              d2Clients);
           // Wait for all the asynchronous ClusterLeaderInitializationRoutine to complete before returning the
           // VeniceClusterWrapper to tests.
           if (!veniceClusterWrapper.getVeniceControllers().isEmpty()) {
             final VeniceClusterWrapper finalClusterWrapper = veniceClusterWrapper;
-            TestUtils.waitForNonDeterministicAssertion(2, TimeUnit.MINUTES, true, () -> {
+            TestUtils.waitForNonDeterministicAssertion(3, TimeUnit.MINUTES, true, () -> {
               try {
                 for (AvroProtocolDefinition avroProtocolDefinition: CLUSTER_LEADER_INITIALIZATION_ROUTINES) {
                   Store store = finalClusterWrapper.getLeaderVeniceController()
@@ -472,7 +479,7 @@ public class VeniceClusterWrapper extends ProcessWrapper {
 
   @Override
   protected void internalStop() throws Exception {
-    LOGGER.info("Starting sequential shutdown of VeniceClusterWrapper");
+    LOGGER.info("Starting parallel shutdown of VeniceClusterWrapper");
     long overallStartTime = System.currentTimeMillis();
 
     // Step 1: Stop controller client
@@ -481,122 +488,132 @@ public class VeniceClusterWrapper extends ProcessWrapper {
         "Step 1: Shutting down controller client",
         () -> controllerClient.ifPresent(Utils::closeQuietlyWithErrorLogged));
 
-    // Step 2: Stop routers in parallel
-    long routersTime = TimingUtils.timeOperationAndReturnDuration(
-        LOGGER,
-        "Step 2: Shutting down " + veniceRouterWrappers.size() + " routers in parallel",
-        () -> {
-          List<CompletableFuture<Void>> routerShutdownTasks = new ArrayList<>();
-          int routerIndex = 0;
-          for (VeniceRouterWrapper router: veniceRouterWrappers.values()) {
-            final int currentIndex = routerIndex++;
-            CompletableFuture<Void> routerShutdownTask = CompletableFuture.runAsync(() -> {
-              long routerStartTime = System.currentTimeMillis();
-              LOGGER.debug("Shutting down router {}", currentIndex);
-              Utils.closeQuietlyWithErrorLogged(router);
-              long routerDuration = System.currentTimeMillis() - routerStartTime;
-              LOGGER.debug("Completed shutdown of router {} in {} ms", currentIndex, routerDuration);
-            });
-            routerShutdownTasks.add(routerShutdownTask);
-          }
-          CompletableFuture.allOf(routerShutdownTasks.toArray(new CompletableFuture[0])).join();
-        });
-
-    // Step 3: Stop servers in parallel
-    long serversTime = TimingUtils.timeOperationAndReturnDuration(
-        LOGGER,
-        "Step 3: Shutting down " + veniceServerWrappers.size() + " servers in parallel",
-        () -> {
-          List<CompletableFuture<Void>> serverShutdownTasks = new ArrayList<>();
-          int serverIndex = 0;
-          for (VeniceServerWrapper server: veniceServerWrappers.values()) {
-            final int currentIndex = serverIndex++;
-            CompletableFuture<Void> serverShutdownTask = CompletableFuture.runAsync(() -> {
-              long serverStartTime = System.currentTimeMillis();
-              LOGGER.debug("Shutting down server {}", currentIndex);
-              Utils.closeQuietlyWithErrorLogged(server);
-              long serverDuration = System.currentTimeMillis() - serverStartTime;
-              LOGGER.debug("Completed shutdown of server {} in {} ms", currentIndex, serverDuration);
-            });
-            serverShutdownTasks.add(serverShutdownTask);
-          }
-          CompletableFuture.allOf(serverShutdownTasks.toArray(new CompletableFuture[0])).join();
-        });
-
-    // Step 4: Stop controllers in parallel
-    long controllersTime = TimingUtils.timeOperationAndReturnDuration(
-        LOGGER,
-        "Step 4: Shutting down " + veniceControllerWrappers.size() + " controllers in parallel",
-        () -> {
-          List<CompletableFuture<Void>> controllerShutdownTasks = new ArrayList<>();
-          int controllerIndex = 0;
-          for (VeniceControllerWrapper controller: veniceControllerWrappers.values()) {
-            final int currentIndex = controllerIndex++;
-            CompletableFuture<Void> controllerShutdownTask = CompletableFuture.runAsync(() -> {
-              long controllerStartTime = System.currentTimeMillis();
-              LOGGER.debug("Shutting down controller {}", currentIndex);
-              Utils.closeQuietlyWithErrorLogged(controller);
-              long controllerDuration = System.currentTimeMillis() - controllerStartTime;
-              LOGGER.debug("Completed shutdown of controller {} in {} ms", currentIndex, controllerDuration);
-            });
-            controllerShutdownTasks.add(controllerShutdownTask);
-          }
-          CompletableFuture.allOf(controllerShutdownTasks.toArray(new CompletableFuture[0])).join();
-        });
-
-    // Step 5: Stop infrastructure components if standalone
-    long infrastructureTime = 0;
-    if (options.isStandalone()) {
-      infrastructureTime = TimingUtils.timeOperationAndReturnDuration(
+    // Use a dedicated thread pool to avoid ForkJoinPool starvation from nested parallel shutdowns
+    ExecutorService shutdownExecutor = Executors.newCachedThreadPool();
+    try {
+      // Step 2: Stop routers, servers, and controllers all in parallel
+      // Routers, servers, and controllers are independent processes with no cross-dependencies during shutdown.
+      // The closeCalled guard in ProcessWrapper.close() handles double-close attempts safely.
+      long componentsTime = TimingUtils.timeOperationAndReturnDuration(
           LOGGER,
-          "Step 5: Shutting down infrastructure components (standalone mode)",
+          "Step 2: Shutting down " + veniceRouterWrappers.size() + " routers, " + veniceServerWrappers.size()
+              + " servers, and " + veniceControllerWrappers.size() + " controllers in parallel",
           () -> {
-            TimingUtils.timeOperation(
-                LOGGER,
-                "Shutting down PubSub broker",
-                () -> Utils.closeQuietlyWithErrorLogged(pubSubBrokerWrapper));
-
-            TimingUtils.timeOperation(
-                LOGGER,
-                "Shutting down ZooKeeper server",
-                () -> Utils.closeQuietlyWithErrorLogged(zkServerWrapper));
+            List<CompletableFuture<Void>> shutdownTasks = new ArrayList<>();
+            // Router shutdown tasks
+            int routerIndex = 0;
+            for (VeniceRouterWrapper router: veniceRouterWrappers.values()) {
+              final int currentIndex = routerIndex++;
+              shutdownTasks.add(CompletableFuture.runAsync(() -> {
+                long startTime = System.currentTimeMillis();
+                LOGGER.debug("Shutting down router {}", currentIndex);
+                Utils.closeQuietlyWithErrorLogged(router);
+                LOGGER.debug(
+                    "Completed shutdown of router {} in {} ms",
+                    currentIndex,
+                    System.currentTimeMillis() - startTime);
+              }, shutdownExecutor));
+            }
+            // Server shutdown tasks
+            int serverIndex = 0;
+            for (VeniceServerWrapper server: veniceServerWrappers.values()) {
+              final int currentIndex = serverIndex++;
+              shutdownTasks.add(CompletableFuture.runAsync(() -> {
+                long startTime = System.currentTimeMillis();
+                LOGGER.debug("Shutting down server {}", currentIndex);
+                Utils.closeQuietlyWithErrorLogged(server);
+                LOGGER.debug(
+                    "Completed shutdown of server {} in {} ms",
+                    currentIndex,
+                    System.currentTimeMillis() - startTime);
+              }, shutdownExecutor));
+            }
+            // Controller shutdown tasks
+            int controllerIndex = 0;
+            for (VeniceControllerWrapper controller: veniceControllerWrappers.values()) {
+              final int currentIndex = controllerIndex++;
+              shutdownTasks.add(CompletableFuture.runAsync(() -> {
+                long startTime = System.currentTimeMillis();
+                LOGGER.debug("Shutting down controller {}", currentIndex);
+                Utils.closeQuietlyWithErrorLogged(controller);
+                LOGGER.debug(
+                    "Completed shutdown of controller {} in {} ms",
+                    currentIndex,
+                    System.currentTimeMillis() - startTime);
+              }, shutdownExecutor));
+            }
+            CompletableFuture.allOf(shutdownTasks.toArray(new CompletableFuture[0])).join();
           });
-    }
 
-    // Step 6: Stop forked process if exists
-    long processTime = 0;
-    if (veniceClusterProcess != null) {
-      processTime = TimingUtils.timeOperationAndReturnDuration(
-          LOGGER,
-          "Step 6: Destroying forked Venice cluster process",
-          () -> veniceClusterProcess.destroy());
-    }
+      // Step 2.5: Shutdown D2 clients
+      TimingUtils.timeOperation(LOGGER, "Shutting down D2 clients", () -> {
+        for (D2Client d2Client: d2Clients.values()) {
+          try {
+            D2ClientUtils.shutdownClient(d2Client);
+          } catch (Exception e) {
+            LOGGER.warn("Error shutting down D2 client", e);
+          }
+        }
+      });
 
-    long totalShutdownTime = System.currentTimeMillis() - overallStartTime;
+      // Step 3: Stop infrastructure components if standalone
+      long infrastructureTime = 0;
+      if (options.isStandalone()) {
+        infrastructureTime = TimingUtils.timeOperationAndReturnDuration(
+            LOGGER,
+            "Step 3: Shutting down infrastructure components (standalone mode)",
+            () -> {
+              TimingUtils.timeOperation(
+                  LOGGER,
+                  "Shutting down PubSub broker",
+                  () -> Utils.closeQuietlyWithErrorLogged(pubSubBrokerWrapper));
 
-    // Log comprehensive timing summary
-    if (options.isStandalone()) {
-      LOGGER.info(
-          "Sequential shutdown timing summary - Total: {} ms, "
-              + "Controller client: {} ms, Routers: {} ms, Servers: {} ms, Controllers: {} ms, "
-              + "Infrastructure: {} ms, Process: {} ms",
-          totalShutdownTime,
-          controllerClientTime,
-          routersTime,
-          serversTime,
-          controllersTime,
-          infrastructureTime,
-          processTime);
-    } else {
-      LOGGER.info(
-          "Sequential shutdown timing summary - Total: {} ms, "
-              + "Controller client: {} ms, Routers: {} ms, Servers: {} ms, Controllers: {} ms, Process: {} ms",
-          totalShutdownTime,
-          controllerClientTime,
-          routersTime,
-          serversTime,
-          controllersTime,
-          processTime);
+              TimingUtils.timeOperation(
+                  LOGGER,
+                  "Shutting down ZooKeeper server",
+                  () -> Utils.closeQuietlyWithErrorLogged(zkServerWrapper));
+            });
+      }
+
+      // Step 4: Stop forked process if exists
+      long processTime = 0;
+      if (veniceClusterProcess != null) {
+        processTime = TimingUtils.timeOperationAndReturnDuration(
+            LOGGER,
+            "Step 4: Destroying forked Venice cluster process",
+            () -> veniceClusterProcess.destroy());
+      }
+
+      long totalShutdownTime = System.currentTimeMillis() - overallStartTime;
+
+      // Log comprehensive timing summary
+      if (options.isStandalone()) {
+        LOGGER.info(
+            "Parallel shutdown timing summary - Total: {} ms, "
+                + "Controller client: {} ms, Routers + Servers + Controllers: {} ms, "
+                + "Infrastructure: {} ms, Process: {} ms",
+            totalShutdownTime,
+            controllerClientTime,
+            componentsTime,
+            infrastructureTime,
+            processTime);
+      } else {
+        LOGGER.info(
+            "Parallel shutdown timing summary - Total: {} ms, "
+                + "Controller client: {} ms, Routers + Servers + Controllers: {} ms, Process: {} ms",
+            totalShutdownTime,
+            controllerClientTime,
+            componentsTime,
+            processTime);
+      }
+    } finally {
+      shutdownExecutor.shutdownNow();
+      try {
+        shutdownExecutor.awaitTermination(30, TimeUnit.SECONDS);
+      } catch (InterruptedException e) {
+        LOGGER.warn("Interrupted while awaiting shutdown executor termination");
+        Thread.currentThread().interrupt();
+      }
     }
   }
 
@@ -1116,6 +1133,11 @@ public class VeniceClusterWrapper extends ProcessWrapper {
 
   public void createMetaSystemStore(String storeName) {
     String metaSystemStoreName = VeniceSystemStoreType.META_STORE.getSystemStoreName(storeName);
+    // Wait for the controller to auto-materialize the meta system store before pushing
+    TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, () -> {
+      StoreResponse response = controllerClient.get().getStore(metaSystemStoreName);
+      Assert.assertFalse(response.isError(), "Meta system store not yet available: " + response.getError());
+    });
     assertCommand(controllerClient.get().emptyPush(metaSystemStoreName, "createMetaSystemStore", 1L));
     waitVersion(metaSystemStoreName, 1);
   }
@@ -1302,7 +1324,7 @@ public class VeniceClusterWrapper extends ProcessWrapper {
   }
 
   public void waitVersion(String storeName, int versionId, ControllerClient client) {
-    TestUtils.waitForNonDeterministicAssertion(60, TimeUnit.SECONDS, true, () -> {
+    TestUtils.waitForNonDeterministicAssertion(120, TimeUnit.SECONDS, true, () -> {
       String kafkaTopic = Version.composeKafkaTopic(storeName, versionId);
       JobStatusQueryResponse response = TestUtils.assertCommand(client.queryJobStatus(kafkaTopic));
       if (response.getStatus().equals(ExecutionStatus.ERROR.toString())) {

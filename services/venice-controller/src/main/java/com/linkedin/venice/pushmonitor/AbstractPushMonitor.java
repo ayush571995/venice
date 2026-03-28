@@ -849,7 +849,7 @@ public abstract class AbstractPushMonitor
             kafkaTopic,
             Collections.singletonList(HelixUtils.getPartitionName(kafkaTopic, partitionId)));
         disabledReplicaMap.computeIfAbsent(instance, k -> new HashSet<>()).add(partitionId);
-        disabledPartitionStats.recordDisabledPartition();
+        disabledPartitionStats.recordDisabledPartition(Version.parseStoreFromKafkaTopicName(kafkaTopic));
       }
 
       @Override
@@ -981,8 +981,10 @@ public abstract class AbstractPushMonitor
 
       if (isEOPReceivedInAllPartitions) {
         // Check whether to send EOP for materialized view topic(s)
+        boolean isFlinkVeniceViewsEnabled = store.isFlinkVeniceViewsEnabled();
         for (ViewConfig rawView: viewConfigMap.values()) {
-          if (MaterializedView.class.getCanonicalName().equals(rawView.getViewClassName())) {
+          if (MaterializedView.class.getCanonicalName().equals(rawView.getViewClassName())
+              && !isFlinkVeniceViewsEnabled) {
             VeniceView veniceView = ViewUtils.getVeniceView(
                 rawView.getViewClassName(),
                 new Properties(),

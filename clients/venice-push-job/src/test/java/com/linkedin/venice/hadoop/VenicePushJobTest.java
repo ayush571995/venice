@@ -6,6 +6,8 @@ import static com.linkedin.venice.status.BatchJobHeartbeatConfigs.HEARTBEAT_ENAB
 import static com.linkedin.venice.utils.ByteUtils.BYTES_PER_MB;
 import static com.linkedin.venice.utils.TestWriteUtils.NAME_RECORD_V1_SCHEMA;
 import static com.linkedin.venice.utils.TestWriteUtils.NAME_RECORD_V1_UPDATE_SCHEMA;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.ALLOW_REGULAR_PUSH_WITH_TTL_REPUSH;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.COMPLIANCE_PUSH;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.CONTROLLER_REQUEST_RETRY_ATTEMPTS;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.D2_ZK_HOSTS_PREFIX;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.DATA_WRITER_COMPUTE_JOB_CLASS;
@@ -15,7 +17,6 @@ import static com.linkedin.venice.vpj.VenicePushJobConstants.DEFAULT_VALUE_FIELD
 import static com.linkedin.venice.vpj.VenicePushJobConstants.DEFER_VERSION_SWAP;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.INCREMENTAL_PUSH;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.INPUT_PATH_PROP;
-import static com.linkedin.venice.vpj.VenicePushJobConstants.KAFKA_INPUT_BROKER_URL;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.KAFKA_INPUT_MAX_RECORDS_PER_MAPPER;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.KAFKA_INPUT_TOPIC;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.KEY_FIELD_PROP;
@@ -26,6 +27,7 @@ import static com.linkedin.venice.vpj.VenicePushJobConstants.PUSH_JOB_TIMEOUT_OV
 import static com.linkedin.venice.vpj.VenicePushJobConstants.REPUSH_TTL_ENABLE;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.REPUSH_TTL_SECONDS;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.REPUSH_TTL_START_TIMESTAMP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.REPUSH_USE_FALLBACK_VALUE_SCHEMA_ID;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.SOURCE_ETL;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.SOURCE_KAFKA;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.TARGETED_REGION_PUSH_ENABLED;
@@ -33,6 +35,7 @@ import static com.linkedin.venice.vpj.VenicePushJobConstants.TARGETED_REGION_PUS
 import static com.linkedin.venice.vpj.VenicePushJobConstants.TARGETED_REGION_PUSH_WITH_DEFERRED_SWAP;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.VALUE_FIELD_PROP;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_DISCOVER_URL_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_REPUSH_SOURCE_PUBSUB_BROKER;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_STORE_NAME_PROP;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
@@ -40,6 +43,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doNothing;
@@ -59,6 +63,7 @@ import static org.testng.Assert.assertThrows;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.fail;
 
+import com.linkedin.d2.balancer.D2Client;
 import com.linkedin.venice.PushJobCheckpoints;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.controllerapi.ControllerClient;
@@ -70,8 +75,11 @@ import com.linkedin.venice.controllerapi.SchemaResponse;
 import com.linkedin.venice.controllerapi.StoreResponse;
 import com.linkedin.venice.controllerapi.VersionCreationResponse;
 import com.linkedin.venice.etl.ETLValueSchemaTransformation;
+import com.linkedin.venice.exceptions.ConcurrentBatchPushException;
 import com.linkedin.venice.exceptions.UndefinedPropertyException;
 import com.linkedin.venice.exceptions.VeniceException;
+import com.linkedin.venice.exceptions.VeniceStoreAclException;
+import com.linkedin.venice.hadoop.exceptions.VeniceSchemaMismatchException;
 import com.linkedin.venice.hadoop.exceptions.VeniceValidationException;
 import com.linkedin.venice.hadoop.mapreduce.datawriter.jobs.DataWriterMRJob;
 import com.linkedin.venice.hadoop.task.datawriter.DataWriterTaskTracker;
@@ -92,11 +100,11 @@ import com.linkedin.venice.serialization.avro.AvroProtocolDefinition;
 import com.linkedin.venice.spark.datawriter.jobs.DataWriterSparkJob;
 import com.linkedin.venice.status.PushJobDetailsStatus;
 import com.linkedin.venice.status.protocol.PushJobDetails;
+import com.linkedin.venice.status.protocol.PushJobDetailsStatusTuple;
 import com.linkedin.venice.utils.DataProviderUtils;
 import com.linkedin.venice.utils.TestWriteUtils;
 import com.linkedin.venice.utils.Time;
 import com.linkedin.venice.utils.VeniceProperties;
-import com.linkedin.venice.views.ChangeCaptureView;
 import com.linkedin.venice.views.MaterializedView;
 import com.linkedin.venice.views.ViewUtils;
 import com.linkedin.venice.writer.VeniceWriter;
@@ -104,6 +112,7 @@ import java.io.File;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -195,11 +204,42 @@ public class VenicePushJobTest {
   }
 
   @Test
+  public void testHandleVersionCreationACLError() {
+    VenicePushJob mockJob = getSpyVenicePushJob(new Properties(), null);
+    Throwable error = new VeniceStoreAclException("ACL error");
+    VersionCreationResponse response = new VersionCreationResponse();
+    response.setError(error);
+    mockJob.handleVersionCreationError(response);
+    verify(mockJob).updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.WRITE_ACL_FAILED);
+  }
+
+  @Test
+  public void testHandleVersionCreationConcurrentPushError() {
+    VenicePushJob mockJob = getSpyVenicePushJob(new Properties(), null);
+    Throwable error = new ConcurrentBatchPushException("Another push is in progress");
+    VersionCreationResponse response = new VersionCreationResponse();
+    response.setError(error);
+    mockJob.handleVersionCreationError(response);
+    verify(mockJob).updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.CONCURRENT_BATCH_PUSH);
+  }
+
+  @Test
   public void testVPJCheckInputUpdateSchema() {
     VenicePushJob vpj = mock(VenicePushJob.class);
     when(vpj.isUpdateSchema(anyString())).thenCallRealMethod();
     Assert.assertTrue(vpj.isUpdateSchema(NAME_RECORD_V1_UPDATE_SCHEMA.toString()));
     Assert.assertFalse(vpj.isUpdateSchema(NAME_RECORD_V1_SCHEMA.toString()));
+  }
+
+  @Test(expectedExceptions = VeniceSchemaMismatchException.class)
+  public void testValidateKeySchemaMismatch() {
+    String keySchema = "\"string\"";
+    String serverKeySchema = "\"int\"";
+    VenicePushJob vpj = getSpyVenicePushJob(new Properties(), null);
+    PushJobSetting setting = vpj.getPushJobSetting();
+    setting.storeKeySchema = AvroSchemaParseUtils.parseSchemaFromJSONLooseValidation(serverKeySchema);
+    setting.keySchema = AvroSchemaParseUtils.parseSchemaFromJSONLooseValidation(keySchema);
+    vpj.validateKeySchema(vpj.getPushJobSetting());
   }
 
   @Test
@@ -387,6 +427,115 @@ public class VenicePushJobTest {
     }
   }
 
+  /**
+   * When repush.use.fallback.value.schema.id is enabled, the latest value schema ID should be
+   * retrieved from the controller as a global fallback for records missing per-record schema IDs.
+   */
+  @Test
+  public void testKifRepushRetrievesValueSchemaIdWhenFallbackEnabled() throws Exception {
+    Properties repushProps = new Properties();
+    repushProps.setProperty(SOURCE_KAFKA, "true");
+    repushProps.setProperty(KAFKA_INPUT_TOPIC, Version.composeKafkaTopic(TEST_STORE, REPUSH_VERSION));
+    repushProps.setProperty(VENICE_REPUSH_SOURCE_PUBSUB_BROKER, "localhost");
+    repushProps.setProperty(KAFKA_INPUT_MAX_RECORDS_PER_MAPPER, "5");
+    repushProps.setProperty(REPUSH_USE_FALLBACK_VALUE_SCHEMA_ID, "true");
+
+    ControllerClient client = getClient(storeInfo -> {
+      Map<String, Integer> coloVersions = new HashMap<>();
+      coloVersions.put("dc-0", REPUSH_VERSION);
+      coloVersions.put("dc-1", REPUSH_VERSION);
+      storeInfo.setColoToCurrentVersions(coloVersions);
+    });
+
+    MultiSchemaResponse valueSchemaResponse = new MultiSchemaResponse();
+    MultiSchemaResponse.Schema schema1 = new MultiSchemaResponse.Schema();
+    schema1.setId(1);
+    schema1.setSchemaStr(VALUE_SCHEMA_STR);
+    MultiSchemaResponse.Schema schema2 = new MultiSchemaResponse.Schema();
+    schema2.setId(2);
+    schema2.setSchemaStr(VALUE_SCHEMA_STR);
+    valueSchemaResponse.setSchemas(new MultiSchemaResponse.Schema[] { schema1, schema2 });
+    doReturn(valueSchemaResponse).when(client).getAllValueSchema(eq(TEST_STORE));
+
+    try (VenicePushJob pushJob = getSpyVenicePushJob(repushProps, client)) {
+      skipVPJValidation(pushJob);
+      doNothing().when(pushJob).pollStatusUntilComplete(any(), any(), any(), any(), anyBoolean(), anyBoolean());
+      pushJob.run();
+
+      assertEquals(
+          pushJob.getPushJobSetting().valueSchemaId,
+          2,
+          "KIF repush should retrieve the latest value schema ID from the controller when fallback is enabled");
+    }
+  }
+
+  /**
+   * By default (repush.use.fallback.value.schema.id=false), the value schema ID should NOT be
+   * retrieved from the controller. The job will fail later if per-record schema IDs are missing.
+   */
+  @Test
+  public void testKifRepushDoesNotRetrieveValueSchemaIdByDefault() throws Exception {
+    Properties repushProps = new Properties();
+    repushProps.setProperty(SOURCE_KAFKA, "true");
+    repushProps.setProperty(KAFKA_INPUT_TOPIC, Version.composeKafkaTopic(TEST_STORE, REPUSH_VERSION));
+    repushProps.setProperty(VENICE_REPUSH_SOURCE_PUBSUB_BROKER, "localhost");
+    repushProps.setProperty(KAFKA_INPUT_MAX_RECORDS_PER_MAPPER, "5");
+    // No REPUSH_USE_FALLBACK_VALUE_SCHEMA_ID set — defaults to false
+
+    ControllerClient client = getClient(storeInfo -> {
+      Map<String, Integer> coloVersions = new HashMap<>();
+      coloVersions.put("dc-0", REPUSH_VERSION);
+      coloVersions.put("dc-1", REPUSH_VERSION);
+      storeInfo.setColoToCurrentVersions(coloVersions);
+    });
+
+    try (VenicePushJob pushJob = getSpyVenicePushJob(repushProps, client)) {
+      skipVPJValidation(pushJob);
+      doNothing().when(pushJob).pollStatusUntilComplete(any(), any(), any(), any(), anyBoolean(), anyBoolean());
+      pushJob.run();
+
+      assertEquals(
+          pushJob.getPushJobSetting().valueSchemaId,
+          0,
+          "KIF repush should NOT retrieve value schema ID when fallback is disabled (default)");
+    }
+  }
+
+  @Test
+  public void testCompliancePushJobConfig() {
+    // Test with compliance push enabled
+    Properties complianceProps = new Properties();
+    complianceProps.setProperty(COMPLIANCE_PUSH, "true");
+    try (VenicePushJob pushJob = getSpyVenicePushJob(complianceProps, null)) {
+      PushJobSetting pushJobSetting = pushJob.getPushJobSetting();
+      Assert.assertTrue(pushJobSetting.isCompliancePush);
+      Assert.assertTrue(Version.isPushIdCompliancePush(pushJob.getPushJobDetails().getPushId().toString()));
+    }
+
+    // Test with compliance push disabled (default)
+    Properties regularProps = new Properties();
+    try (VenicePushJob pushJob = getSpyVenicePushJob(regularProps, null)) {
+      PushJobSetting pushJobSetting = pushJob.getPushJobSetting();
+      Assert.assertFalse(pushJobSetting.isCompliancePush);
+      Assert.assertFalse(Version.isPushIdCompliancePush(pushJob.getPushJobDetails().getPushId().toString()));
+    }
+
+    // Compliance push cannot be combined with TTL repush
+    Properties complianceRepushProps = getRepushWithTTLProps();
+    complianceRepushProps.setProperty(COMPLIANCE_PUSH, "true");
+    VeniceException e =
+        Assert.expectThrows(VeniceException.class, () -> getSpyVenicePushJob(complianceRepushProps, null));
+    Assert.assertTrue(e.getMessage().contains("Compliance push cannot be combined with TTL repush settings"));
+
+    // Compliance push cannot be combined with regular push with TTL repush
+    Properties complianceRegularTTLProps = new Properties();
+    complianceRegularTTLProps.setProperty(COMPLIANCE_PUSH, "true");
+    complianceRegularTTLProps.setProperty(ALLOW_REGULAR_PUSH_WITH_TTL_REPUSH, "true");
+    VeniceException e2 =
+        Assert.expectThrows(VeniceException.class, () -> getSpyVenicePushJob(complianceRegularTTLProps, null));
+    Assert.assertTrue(e2.getMessage().contains("Compliance push cannot be combined with TTL repush settings"));
+  }
+
   @Test
   public void testPushJobSettingWithD2Routing() {
     ControllerClient client = getClient(storeInfo -> {
@@ -547,7 +696,7 @@ public class VenicePushJobTest {
     repushProps.setProperty(REPUSH_TTL_ENABLE, "true");
     repushProps.setProperty(SOURCE_KAFKA, "true");
     repushProps.setProperty(KAFKA_INPUT_TOPIC, Version.composeKafkaTopic(TEST_STORE, REPUSH_VERSION));
-    repushProps.setProperty(KAFKA_INPUT_BROKER_URL, "localhost");
+    repushProps.setProperty(VENICE_REPUSH_SOURCE_PUBSUB_BROKER, "localhost");
     repushProps.setProperty(KAFKA_INPUT_MAX_RECORDS_PER_MAPPER, "5");
     return repushProps;
   }
@@ -1382,8 +1531,7 @@ public class VenicePushJobTest {
         new MaterializedViewParameters.Builder("testView").setPartitionCount(12)
             .setPartitioner(DefaultVenicePartitioner.class.getCanonicalName());
     viewConfigs.put("testView", new ViewConfigImpl(MaterializedView.class.getCanonicalName(), builder.build()));
-    viewConfigs
-        .put("dummyView", new ViewConfigImpl(ChangeCaptureView.class.getCanonicalName(), Collections.emptyMap()));
+    viewConfigs.put("dummyView", new ViewConfigImpl("com.linkedin.venice.views.DummyView", Collections.emptyMap()));
     Version version = new VersionImpl(TEST_STORE, 1, TEST_PUSH);
     version.setViewConfigs(viewConfigs);
     client = getClient(storeInfo -> {
@@ -1409,6 +1557,50 @@ public class VenicePushJobTest {
       Assert.assertEquals(viewConfigMap.size(), 1);
       Assert.assertTrue(viewConfigMap.containsKey("testView"));
       Assert.assertEquals(viewConfigMap.get("testView").getViewClassName(), MaterializedView.class.getCanonicalName());
+    }
+  }
+
+  @Test
+  public void testConfigureWithMaterializedViewConfigsWithFlinkVeniceViewsEnabled() throws Exception {
+    Properties properties = getVpjRequiredProperties();
+    properties.put(KEY_FIELD_PROP, "id");
+    properties.put(VALUE_FIELD_PROP, "name");
+    JobStatusQueryResponse response = mockJobStatusQuery();
+    ControllerClient client = getClient();
+    doReturn(response).when(client).queryOverallJobStatus(anyString(), any(), eq(null), anyBoolean());
+    try (final VenicePushJob vpj = getSpyVenicePushJob(properties, client)) {
+      skipVPJValidation(vpj);
+      vpj.run();
+      PushJobSetting pushJobSetting = vpj.getPushJobSetting();
+      Assert.assertNull(pushJobSetting.materializedViewConfigFlatMap);
+    }
+    Map<String, ViewConfig> viewConfigs = new HashMap<>();
+    MaterializedViewParameters.Builder builder =
+        new MaterializedViewParameters.Builder("testView").setPartitionCount(12)
+            .setPartitioner(DefaultVenicePartitioner.class.getCanonicalName());
+    viewConfigs.put("testView", new ViewConfigImpl(MaterializedView.class.getCanonicalName(), builder.build()));
+    viewConfigs.put("dummyView", new ViewConfigImpl("com.linkedin.venice.views.DummyView", Collections.emptyMap()));
+    Version version = new VersionImpl(TEST_STORE, 1, TEST_PUSH);
+    version.setViewConfigs(viewConfigs);
+    client = getClient(storeInfo -> {
+      storeInfo.setViewConfigs(viewConfigs);
+      storeInfo.setVersions(Collections.singletonList(version));
+      storeInfo.setFlinkVeniceViewsEnabled(true); // Enable Flink Venice Views at store level
+    }, true);
+    doReturn(response).when(client).queryOverallJobStatus(anyString(), any(), eq(null), anyBoolean());
+    MultiSchemaResponse valueSchemaResponse = getMultiSchemaResponse();
+    MultiSchemaResponse.Schema[] schemas = new MultiSchemaResponse.Schema[1];
+    schemas[0] = getBasicSchema();
+    valueSchemaResponse.setSchemas(schemas);
+    doReturn(valueSchemaResponse).when(client).getAllValueSchema(TEST_STORE);
+    doReturn(getMultiSchemaResponse()).when(client).getAllReplicationMetadataSchemas(TEST_STORE);
+    doReturn(getKeySchemaResponse()).when(client).getKeySchema(TEST_STORE);
+    try (final VenicePushJob vpj = getSpyVenicePushJob(properties, client)) {
+      skipVPJValidation(vpj);
+      vpj.run();
+      PushJobSetting pushJobSetting = vpj.getPushJobSetting();
+      Assert.assertNull(pushJobSetting.materializedViewConfigFlatMap); // Should be null since Flink Venice Views is
+                                                                       // enabled
     }
   }
 
@@ -1460,6 +1652,64 @@ public class VenicePushJobTest {
 
     try (VenicePushJob pushJob = getSpyVenicePushJob(props, client)) {
       pushJob.run();
+    }
+  }
+
+  /**
+   * Test that START_VERSION_SWAP checkpoint is invoked when target region push with deferred swap is enabled.
+   */
+  @Test
+  public void testVersionSwapCheckpoint() throws Exception {
+    Properties props = getVpjRequiredProperties();
+    props.put(KEY_FIELD_PROP, "id");
+    props.put(VALUE_FIELD_PROP, "name");
+    props.put(TARGETED_REGION_PUSH_WITH_DEFERRED_SWAP, true);
+    props.put(TARGETED_REGION_PUSH_LIST, "dc-0");
+
+    // Create a version with ONLINE status to simulate successful version swap
+    Version version = new VersionImpl(TEST_STORE, 1);
+    version.setNumber(1);
+    version.setStatus(VersionStatus.ONLINE);
+
+    ControllerClient client = getClient(storeInfo -> {
+      storeInfo.setColoToCurrentVersions(new HashMap<String, Integer>() {
+        {
+          put("dc-0", 1);
+          put("dc-1", 1);
+        }
+      });
+      storeInfo.setVersions(Collections.singletonList(version));
+      storeInfo.setLargestUsedVersionNumber(1);
+      storeInfo.setTargetRegionSwapWaitTime(60); // 60 minutes wait time
+    });
+
+    try (VenicePushJob pushJob = getSpyVenicePushJob(props, client)) {
+      skipVPJValidation(pushJob);
+
+      // Mock job status query to return COMPLETED
+      JobStatusQueryResponse response = mockJobStatusQuery();
+      doReturn(response).when(client).queryOverallJobStatus(anyString(), any(), anyString(), anyBoolean());
+
+      pushJob.run();
+
+      // Verify that START_VERSION_SWAP checkpoint is called
+      verify(pushJob).updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.START_VERSION_SWAP);
+
+      // Verify that COMPLETE_VERSION_SWAP checkpoint is called
+      verify(pushJob).updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.COMPLETE_VERSION_SWAP);
+
+      // Get the actual PushJobDetails object
+      PushJobDetails pushJobDetails = pushJob.getPushJobDetails();
+
+      // Verify that COMPLETED status was added to overallStatus
+      boolean foundCompletedStatus = false;
+      for (PushJobDetailsStatusTuple statusTuple: pushJobDetails.overallStatus) {
+        if (statusTuple.status == PushJobDetailsStatus.COMPLETED.getValue()) {
+          foundCompletedStatus = true;
+          break;
+        }
+      }
+      assertTrue(foundCompletedStatus);
     }
   }
 
@@ -1568,7 +1818,8 @@ public class VenicePushJobTest {
               anyBoolean(),
               any(),
               anyInt(),
-              anyBoolean());
+              anyBoolean(),
+              anyInt());
     }
 
     return versionCreationResponse;
@@ -1605,7 +1856,7 @@ public class VenicePushJobTest {
   /** Sets basic values for the given {@link PushJobSetting} object in order for VeniceWriter to be constructed. */
   private void setPushJobSettingDefaults(PushJobSetting setting) {
     setting.storeName = TEST_STORE;
-    setting.kafkaUrl = "localhost:9092";
+    setting.pushDestinationPubsubBroker = "localhost:9092";
     setting.partitionerParams = new HashMap<>();
     setting.partitionerClass = DefaultVenicePartitioner.class.getCanonicalName();
     setting.topic = Version.composeKafkaTopic(setting.storeName, 7);
@@ -1665,5 +1916,112 @@ public class VenicePushJobTest {
             "Version kafka-topic was rolled back after ingestion completed due to validation failure");
       }
     }
+  }
+
+  /**
+   * Test that VPJ detects a killed push during the data writing phase and kills the data writer job.
+   * This simulates the scenario where a repush is superseded by a user push, and the controller kills
+   * the repush version while data is still being written.
+   */
+  @Test(dataProvider = "DataWriterJobClasses")
+  public void testPushJobKilledDuringDataWriting(Class<? extends DataWriterComputeJob> dataWriterJobClass)
+      throws Exception {
+    Properties props = getVpjRequiredProperties();
+    props.put(KEY_FIELD_PROP, "id");
+    props.put(VALUE_FIELD_PROP, "name");
+    props.put(DATA_WRITER_COMPUTE_JOB_CLASS, dataWriterJobClass.getCanonicalName());
+    ControllerClient client = getClient();
+
+    // Simulate controller returning ERROR status (push was killed)
+    JobStatusQueryResponse killResponse = mock(JobStatusQueryResponse.class);
+    doReturn(ExecutionStatus.ERROR.toString()).when(killResponse).getStatus();
+    doReturn(false).when(killResponse).isError();
+    doReturn(killResponse).when(client).queryOverallJobStatus(anyString(), any(), any(), anyBoolean());
+
+    try (VenicePushJob pushJob = getSpyVenicePushJob(props, client)) {
+      PushJobSetting pushJobSetting = pushJob.getPushJobSetting();
+      pushJobSetting.pollJobStatusIntervalMs = 10; // Poll quickly for the test
+
+      CountDownLatch dataWriterRunningLatch = new CountDownLatch(1);
+      CountDownLatch dataWriterKilledLatch = new CountDownLatch(1);
+
+      // Stall the data writer job until it gets killed by the kill-check monitor
+      doCallRealMethod().when(pushJob).runJobWithKillDetection();
+      doCallRealMethod().when(pushJob).runJobAndUpdateStatus();
+      doCallRealMethod().when(pushJob).startPushJobKillCheckMonitor();
+      doCallRealMethod().when(pushJob).stopPushJobKillCheckMonitor();
+      doCallRealMethod().when(pushJob).killDataWriterJob();
+
+      DataWriterComputeJob dataWriterJob = spy(pushJob.getDataWriterComputeJob());
+      pushJob.setDataWriterComputeJob(dataWriterJob);
+      doNothing().when(dataWriterJob).configure(any(), any());
+      doNothing().when(dataWriterJob).validateJob();
+
+      Answer<Void> stallDataWriterJob = invocation -> {
+        dataWriterRunningLatch.countDown();
+        if (!dataWriterKilledLatch.await(10, TimeUnit.SECONDS)) {
+          fail("Timed out waiting for the data writer job to be killed by kill-check monitor");
+        }
+        throw new VeniceException("Data writer job was killed");
+      };
+      doAnswer(stallDataWriterJob).when(dataWriterJob).runComputeJob();
+
+      // When dataWriterJob.kill() is called, release the stalled data writer
+      doAnswer(invocation -> {
+        invocation.callRealMethod();
+        dataWriterKilledLatch.countDown();
+        return null;
+      }).when(dataWriterJob).kill();
+
+      // Stub only the validation methods from skipVPJValidation that this test needs bypassed.
+      // We intentionally avoid skipVPJValidation() because it also stubs runJobAndUpdateStatus(),
+      // which we need to run for kill-detection to work.
+      doAnswer(invocation -> {
+        VeniceProperties properties = pushJob.getJobProperties();
+        PushJobSetting pjs = pushJob.getPushJobSetting();
+        if (!pjs.isSourceKafka) {
+          Schema schema = AvroSchemaParseUtils.parseSchemaFromJSONLooseValidation(SIMPLE_FILE_SCHEMA_STR);
+          pjs.keyField = properties.getString(KEY_FIELD_PROP, DEFAULT_KEY_FIELD_PROP);
+          pjs.valueField = properties.getString(VALUE_FIELD_PROP, DEFAULT_VALUE_FIELD_PROP);
+          pjs.inputDataSchema = schema;
+          pjs.valueSchema = schema.getField(pjs.valueField).schema();
+          pjs.inputDataSchemaString = SIMPLE_FILE_SCHEMA_STR;
+          pjs.keySchema = pjs.inputDataSchema.getField(pjs.keyField).schema();
+          pjs.keySchemaString = pjs.keySchema.toString();
+          pjs.valueSchemaString = pjs.valueSchema.toString();
+        }
+        return getMockInputDataInfoProvider();
+      }).when(pushJob).getInputDataInfoProvider();
+      doNothing().when(pushJob).validateKeySchema(any());
+      doNothing().when(pushJob).validateAndRetrieveValueSchemas(any(), any(), anyBoolean());
+
+      try {
+        pushJob.run();
+        fail("Expected VeniceException due to push job being killed during data writing");
+      } catch (VeniceException e) {
+        assertTrue(
+            e.getMessage().contains("killed by the controller during the data writing phase")
+                || e.getMessage().contains("Data writer job was killed"),
+            "Unexpected error message: " + e.getMessage());
+      }
+
+      assertEquals(dataWriterRunningLatch.getCount(), 0, "Data writer job should have started");
+      assertEquals(dataWriterKilledLatch.getCount(), 0, "Data writer job should have been killed");
+      verify(dataWriterJob, times(1)).kill();
+      verify(client, atLeastOnce()).queryOverallJobStatus(anyString(), any(), any(), anyBoolean());
+    }
+  }
+
+  @Test
+  public void testResolveD2ClientWithExternalD2Client() {
+    D2Client mockD2Client = mock(D2Client.class);
+
+    Properties baseProps = TestWriteUtils.defaultVPJProps(TEST_URL, TEST_PATH, TEST_STORE, Collections.emptyMap());
+    baseProps.put(CONTROLLER_REQUEST_RETRY_ATTEMPTS, 1);
+
+    // When an external D2Client is provided, resolveD2Client should return it directly
+    VenicePushJob pushJob = new VenicePushJob(TEST_PUSH, baseProps, mockD2Client);
+    D2Client resolved = pushJob.resolveD2Client("someZkHost", Optional.empty());
+    assertEquals(resolved, mockD2Client);
   }
 }

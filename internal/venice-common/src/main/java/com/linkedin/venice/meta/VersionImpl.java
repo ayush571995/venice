@@ -301,6 +301,16 @@ public class VersionImpl implements Version {
   }
 
   @Override
+  public String getBlobDbEnabled() {
+    return this.storeVersion.blobDbEnabled.toString();
+  }
+
+  @Override
+  public void setBlobDbEnabled(String blobDbEnabled) {
+    this.storeVersion.blobDbEnabled = blobDbEnabled;
+  }
+
+  @Override
   public boolean isUseVersionLevelIncrementalPushEnabled() {
     return this.storeVersion.useVersionLevelIncrementalPushEnabled;
   }
@@ -398,6 +408,16 @@ public class VersionImpl implements Version {
   }
 
   @Override
+  public void setRepushTtlSeconds(int ttlSeconds) {
+    this.storeVersion.repushTtlSeconds = ttlSeconds;
+  }
+
+  @Override
+  public int getRepushTtlSeconds() {
+    return this.storeVersion.repushTtlSeconds;
+  }
+
+  @Override
   public int getRmdVersionId() {
     return this.storeVersion.timestampMetadataVersionId;
   }
@@ -468,6 +488,16 @@ public class VersionImpl implements Version {
       return Collections.emptyList();
     }
     return this.storeVersion.keyUrnFields.stream().map(Objects::toString).collect(Collectors.toList());
+  }
+
+  @Override
+  public int getPreviousCurrentVersion() {
+    return this.storeVersion.previousCurrentVersion;
+  }
+
+  @Override
+  public void setPreviousCurrentVersion(int previousCurrentVersion) {
+    this.storeVersion.previousCurrentVersion = previousCurrentVersion;
   }
 
   @Override
@@ -557,6 +587,8 @@ public class VersionImpl implements Version {
     clonedVersion.setGlobalRtDivEnabled(isGlobalRtDivEnabled());
     clonedVersion.setKeyUrnCompressionEnabled(isKeyUrnCompressionEnabled());
     clonedVersion.setKeyUrnFields(getKeyUrnFields());
+    clonedVersion.setRepushTtlSeconds(getRepushTtlSeconds());
+    clonedVersion.setPreviousCurrentVersion(getPreviousCurrentVersion());
     return clonedVersion;
   }
 

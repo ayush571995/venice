@@ -1,8 +1,7 @@
 package com.linkedin.venice.endToEnd;
 
+import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED;
 import static com.linkedin.venice.ConfigKeys.OFFLINE_JOB_START_TIMEOUT_MS;
-import static com.linkedin.venice.ConfigKeys.SERVER_HTTP2_INBOUND_ENABLED;
-import static com.linkedin.venice.ConfigKeys.SERVER_QUOTA_ENFORCEMENT_ENABLED;
 import static com.linkedin.venice.ConfigKeys.TOPIC_CLEANUP_SLEEP_INTERVAL_BETWEEN_TOPIC_LIST_FETCH_MS;
 import static com.linkedin.venice.utils.TestWriteUtils.getTempDataDirectory;
 import static com.linkedin.venice.vpj.VenicePushJobConstants.DEFAULT_KEY_FIELD_PROP;
@@ -15,7 +14,6 @@ import com.linkedin.venice.client.store.AvroGenericStoreClient;
 import com.linkedin.venice.client.store.ClientConfig;
 import com.linkedin.venice.client.store.ClientFactory;
 import com.linkedin.venice.client.store.StatTrackingStoreClient;
-import com.linkedin.venice.common.VeniceSystemStoreUtils;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.controllerapi.ControllerClient;
 import com.linkedin.venice.controllerapi.StoreResponse;
@@ -23,6 +21,7 @@ import com.linkedin.venice.controllerapi.UpdateStoreQueryParams;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.hadoop.VenicePushJob;
 import com.linkedin.venice.integration.utils.D2TestUtils;
+import com.linkedin.venice.integration.utils.IntegrationTestUtils;
 import com.linkedin.venice.integration.utils.ServiceFactory;
 import com.linkedin.venice.integration.utils.VeniceMultiClusterWrapper;
 import com.linkedin.venice.integration.utils.VeniceMultiRegionClusterCreateOptions;
@@ -70,14 +69,12 @@ public class TestStoreMigrationMultiRegion {
   @BeforeClass(timeOut = TEST_TIMEOUT)
   public void setUp() {
     Utils.thisIsLocalhost();
-    Properties parentControllerProperties = new Properties();
-    parentControllerProperties
-        .setProperty(TOPIC_CLEANUP_SLEEP_INTERVAL_BETWEEN_TOPIC_LIST_FETCH_MS, String.valueOf(4000));
-    parentControllerProperties.setProperty(OFFLINE_JOB_START_TIMEOUT_MS, "180000");
+    Properties controllerProperties = new Properties();
+    controllerProperties.setProperty(TOPIC_CLEANUP_SLEEP_INTERVAL_BETWEEN_TOPIC_LIST_FETCH_MS, String.valueOf(4000));
+    controllerProperties.setProperty(OFFLINE_JOB_START_TIMEOUT_MS, "180000");
 
     Properties serverProperties = new Properties();
-    serverProperties.put(SERVER_HTTP2_INBOUND_ENABLED, "true");
-    serverProperties.put(SERVER_QUOTA_ENFORCEMENT_ENABLED, "true");
+    serverProperties.put(ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED, false);
 
     // 1 parent controller, 2 child region, 2 clusters per child region, 2 servers per cluster
     // RF=2 to test both leader and follower SNs
@@ -86,13 +83,12 @@ public class TestStoreMigrationMultiRegion {
             .numberOfClusters(2)
             .numberOfParentControllers(1)
             .numberOfChildControllers(1)
-            .numberOfServers(2)
+            .numberOfServers(1)
             .numberOfRouters(1)
-            .replicationFactor(2)
-            .sslToStorageNodes(true)
+            .replicationFactor(1)
             .forkServer(false)
-            .parentControllerProperties(parentControllerProperties)
-            .childControllerProperties(null)
+            .parentControllerProperties(controllerProperties)
+            .childControllerProperties(controllerProperties)
             .serverProperties(serverProperties);
     twoLayerMultiRegionMultiClusterWrapper =
         ServiceFactory.getVeniceTwoLayerMultiRegionMultiClusterWrapper(optionsBuilder.build());
@@ -109,23 +105,7 @@ public class TestStoreMigrationMultiRegion {
     multiClusterWrapper1 = twoLayerMultiRegionMultiClusterWrapper.getChildRegions().get(1);
     childControllerUrl1 = multiClusterWrapper1.getControllerConnectString();
 
-    for (String cluster: clusterNames) {
-      try (ControllerClient controllerClient0 = new ControllerClient(cluster, childControllerUrl0);
-          ControllerClient controllerClient1 = new ControllerClient(cluster, childControllerUrl1)) {
-        // Verify the participant store is up and running in child region
-        String participantStoreName = VeniceSystemStoreUtils.getParticipantStoreNameForCluster(cluster);
-        TestUtils.waitForNonDeterministicPushCompletion(
-            Version.composeKafkaTopic(participantStoreName, 1),
-            controllerClient0,
-            3,
-            TimeUnit.MINUTES);
-        TestUtils.waitForNonDeterministicPushCompletion(
-            Version.composeKafkaTopic(participantStoreName, 1),
-            controllerClient1,
-            3,
-            TimeUnit.MINUTES);
-      }
-    }
+    IntegrationTestUtils.waitForParticipantStorePush(clusterNames, childControllerUrl0, childControllerUrl1);
   }
 
   @AfterClass(alwaysRun = true)

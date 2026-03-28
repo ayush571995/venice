@@ -5,6 +5,7 @@ import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 
 import com.linkedin.davinci.config.VeniceServerConfig;
+import com.linkedin.davinci.storage.StorageEngineRepository;
 import com.linkedin.venice.acl.DynamicAccessController;
 import com.linkedin.venice.acl.StaticAccessController;
 import com.linkedin.venice.authorization.DefaultIdentityParser;
@@ -16,6 +17,7 @@ import com.linkedin.venice.security.SSLFactory;
 import io.grpc.ServerInterceptor;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.socket.SocketChannel;
+import io.netty.util.Attribute;
 import io.tehuti.metrics.MetricsRepository;
 import java.util.List;
 import java.util.Optional;
@@ -38,18 +40,21 @@ public class HttpChannelInitializerTest {
   private Optional<StaticAccessController> accessController;
   private Optional<DynamicAccessController> storeAccessController;
   private StorageReadRequestHandler requestHandler;
+  private StorageEngineRepository storageEngineRepository;
 
   @BeforeMethod
   public void setUp() {
     storeMetadataRepository = mock(ReadOnlyStoreRepository.class);
     metricsRepository = new MetricsRepository();
     sslFactory = mock(SSLFactory.class);
+    doReturn(new SSLConfig()).when(sslFactory).getSSLConfig();
     sslFactoryOptional = Optional.of(sslFactory);
     sslHandshakeExecutor = mock(ThreadPoolExecutor.class);
     accessController = Optional.of(mock(StaticAccessController.class));
     storeAccessController = Optional.of(mock(DynamicAccessController.class));
     requestHandler = mock(StorageReadRequestHandler.class);
     serverConfig = mock(VeniceServerConfig.class);
+    storageEngineRepository = mock(StorageEngineRepository.class);
     customizedViewRepository = new CompletableFuture<>();
     doReturn(DefaultIdentityParser.class.getName()).when(serverConfig).getIdentityParserClassName();
   }
@@ -69,7 +74,8 @@ public class HttpChannelInitializerTest {
         serverConfig,
         accessController,
         storeAccessController,
-        requestHandler);
+        requestHandler,
+        storageEngineRepository);
     Assert.assertNotNull(initializer.getQuotaEnforcer());
   }
 
@@ -86,7 +92,8 @@ public class HttpChannelInitializerTest {
         serverConfig,
         accessController,
         storeAccessController,
-        requestHandler);
+        requestHandler,
+        storageEngineRepository);
     Assert.assertNull(initializer.getQuotaEnforcer());
   }
 
@@ -97,6 +104,7 @@ public class HttpChannelInitializerTest {
     ChannelPipeline channelPipeline = mock(ChannelPipeline.class);
     SocketChannel ch = mock(SocketChannel.class);
     doReturn(channelPipeline).when(ch).pipeline();
+    doReturn(mock(Attribute.class)).when(ch).attr(any());
     doReturn(channelPipeline).when(channelPipeline).addLast(any());
     HttpChannelInitializer initializer = new HttpChannelInitializer(
         storeMetadataRepository,
@@ -107,7 +115,8 @@ public class HttpChannelInitializerTest {
         serverConfig,
         accessController,
         storeAccessController,
-        requestHandler);
+        requestHandler,
+        storageEngineRepository);
     initializer.initChannel(ch);
   }
 
@@ -124,7 +133,8 @@ public class HttpChannelInitializerTest {
         serverConfig,
         accessController,
         storeAccessController,
-        requestHandler);
+        requestHandler,
+        storageEngineRepository);
 
     VeniceServerGrpcRequestProcessor processor = initializer.initGrpcRequestProcessor();
     Assert.assertNotNull(processor);
@@ -143,7 +153,8 @@ public class HttpChannelInitializerTest {
         serverConfig,
         accessController,
         storeAccessController,
-        requestHandler);
+        requestHandler,
+        storageEngineRepository);
 
     List<ServerInterceptor> interceptors = initializer.initGrpcInterceptors();
     Assert.assertNotNull(interceptors);

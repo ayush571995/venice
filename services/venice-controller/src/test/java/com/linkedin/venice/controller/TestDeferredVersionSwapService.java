@@ -4,6 +4,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
@@ -17,6 +18,7 @@ import com.linkedin.venice.controllerapi.JobStatusQueryResponse;
 import com.linkedin.venice.controllerapi.StoreResponse;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.hooks.StoreVersionLifecycleEventOutcome;
+import com.linkedin.venice.meta.ConcurrentPushDetectionStrategy;
 import com.linkedin.venice.meta.LifecycleHooksRecord;
 import com.linkedin.venice.meta.LifecycleHooksRecordImpl;
 import com.linkedin.venice.meta.ReadWriteStoreRepository;
@@ -82,6 +84,8 @@ public class TestDeferredVersionSwapService {
     doReturn("").when(clusterConfig).getDeferredVersionSwapRegionRollforwardOrder();
     doReturn(clusterConfig).when(veniceControllerMultiClusterConfig).getControllerConfig(clusterName);
     doReturn(1).when(clusterConfig).getDeferredVersionSwapThreadPoolSize();
+    doReturn(ConcurrentPushDetectionStrategy.PARENT_VERSION_STATUS_ONLY).when(clusterConfig)
+        .getConcurrentPushDetectionStrategy();
 
     childDatacenterToUrl.put(region1, "test");
     childDatacenterToUrl.put(region2, "test");
@@ -264,6 +268,7 @@ public class TestDeferredVersionSwapService {
     TestUtils.waitForNonDeterministicAssertion(5, TimeUnit.SECONDS, () -> {
       verify(admin, atLeast(1)).rollForwardToFutureVersion(clusterName, storeName, region2 + "," + region3);
       verify(store, atLeast(1)).updateVersionStatus(versionTwo, VersionStatus.ONLINE);
+      verify(admin, never()).truncateKafkaTopic(anyString());
     });
   }
 
@@ -405,7 +410,7 @@ public class TestDeferredVersionSwapService {
     deferredVersionSwapService.startInner();
 
     TestUtils.waitForNonDeterministicAssertion(5, TimeUnit.SECONDS, () -> {
-      verify(mockDeferredVersionSwapStats, atLeast(1)).recordDeferredVersionSwapStalledVersionSwapSensor(1.0);
+      verify(mockDeferredVersionSwapStats, atLeast(1)).recordDeferredVersionSwapStalledVersionSwapMetric(eq(1.0));
     });
   }
 
@@ -463,7 +468,8 @@ public class TestDeferredVersionSwapService {
     deferredVersionSwapService.startInner();
 
     TestUtils.waitForNonDeterministicAssertion(5, TimeUnit.SECONDS, () -> {
-      verify(deferredVersionSwapStats, atLeast(1)).recordDeferredVersionSwapParentChildStatusMismatchSensor();
+      verify(deferredVersionSwapStats, atLeast(1))
+          .recordDeferredVersionSwapParentChildStatusMismatchMetric(anyString(), anyString());
     });
   }
 
@@ -527,6 +533,7 @@ public class TestDeferredVersionSwapService {
     TestUtils.waitForNonDeterministicAssertion(5, TimeUnit.SECONDS, () -> {
       verify(admin, atLeast(1)).rollForwardToFutureVersion(clusterName, storeName, region2 + "," + region3);
       verify(store, atLeast(1)).updateVersionStatus(versionTwo, VersionStatus.PARTIALLY_ONLINE);
+      verify(admin, never()).truncateKafkaTopic(anyString());
     });
   }
 
@@ -583,7 +590,8 @@ public class TestDeferredVersionSwapService {
     deferredVersionSwapService.startInner();
 
     TestUtils.waitForNonDeterministicAssertion(5, TimeUnit.SECONDS, () -> {
-      verify(deferredVersionSwapStats, atLeast(1)).recordDeferredVersionSwapParentChildStatusMismatchSensor();
+      verify(deferredVersionSwapStats, atLeast(1))
+          .recordDeferredVersionSwapParentChildStatusMismatchMetric(anyString(), anyString());
     });
   }
 
@@ -645,6 +653,7 @@ public class TestDeferredVersionSwapService {
 
     TestUtils.waitForNonDeterministicAssertion(5, TimeUnit.SECONDS, () -> {
       verify(store, atLeast(1)).updateVersionStatus(2, VersionStatus.ONLINE);
+      verify(admin, never()).truncateKafkaTopic(anyString());
     });
   }
 

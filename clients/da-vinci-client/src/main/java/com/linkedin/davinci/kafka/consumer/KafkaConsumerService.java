@@ -17,6 +17,7 @@ import com.linkedin.venice.pubsub.api.PubSubConsumerAdapter;
 import com.linkedin.venice.pubsub.api.PubSubPosition;
 import com.linkedin.venice.pubsub.api.PubSubTopic;
 import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
+import com.linkedin.venice.utils.DaemonThreadFactory;
 import com.linkedin.venice.utils.ExceptionUtils;
 import com.linkedin.venice.utils.LatencyUtils;
 import com.linkedin.venice.utils.RandomAccessDaemonThreadFactory;
@@ -27,6 +28,7 @@ import com.linkedin.venice.utils.VeniceProperties;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import com.linkedin.venice.utils.locks.AutoCloseableLock;
 import io.tehuti.metrics.MetricsRepository;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -34,9 +36,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.IntConsumer;
 import java.util.function.LongSupplier;
@@ -63,7 +68,7 @@ import org.apache.logging.log4j.Logger;
  *    c) {@link ConsumerSubscriptionCleaner}
  * 2. Receive various calls to interrogate or mutate consumer state, and delegate them to the correct unit, by
  *    maintaining a mapping of which unit belongs to which version-topic and subscribed topic-partition. Notably,
- *    the {@link #startConsumptionIntoDataReceiver(PartitionReplicaIngestionContext, PubSubPosition, ConsumedDataReceiver)} function allows the
+ *    the {@link AbstractKafkaConsumerService#startConsumptionIntoDataReceiver(PartitionReplicaIngestionContext, PubSubPosition, ConsumedDataReceiver, boolean)} function allows the
  *    caller to start funneling consumed data into a receiver (i.e. into another task).
  * 3. Provide a single abstract function that must be overridden by subclasses in order to implement a consumption
  *    load balancing strategy: {@link #pickConsumerForPartition(PubSubTopic, PubSubTopicPartition)}
@@ -88,6 +93,8 @@ public abstract class KafkaConsumerService extends AbstractKafkaConsumerService 
   private RandomAccessDaemonThreadFactory threadFactory;
   private final Logger LOGGER;
   private final ExecutorService consumerExecutor;
+  private final ExecutorService crossTpProcessingPool;
+  private final ExecutorService batchUnsubscribeExecutor;
   private static final int SHUTDOWN_TIMEOUT_IN_SECOND = 1;
   // 4MB bitset size, 2 bitmaps for active and old bitset
   private static final RedundantExceptionFilter REDUNDANT_LOGGING_FILTER =
@@ -118,7 +125,8 @@ public abstract class KafkaConsumerService extends AbstractKafkaConsumerService 
       final ReadOnlyStoreRepository metadataRepository,
       final boolean isUnregisterMetricForDeletedStoreEnabled,
       final VeniceServerConfig serverConfig,
-      final PubSubContext pubSubContext) {
+      final PubSubContext pubSubContext,
+      final ExecutorService crossTpProcessingPool) {
     this.kafkaUrl = consumerProperties.getProperty(KAFKA_BOOTSTRAP_SERVERS);
     this.kafkaUrlForLogger = Utils.getSanitizedStringForLogger(kafkaUrl);
     this.LOGGER = LogManager.getLogger(
@@ -130,6 +138,15 @@ public abstract class KafkaConsumerService extends AbstractKafkaConsumerService 
     String consumerNamePrefix = "venice-shared-consumer-for-" + kafkaUrl + '-' + poolType.getStatSuffix();
     threadFactory = new RandomAccessDaemonThreadFactory(consumerNamePrefix, serverConfig.getLogContext());
     consumerExecutor = Executors.newFixedThreadPool(numOfConsumersPerKafkaCluster, threadFactory);
+
+    // Use the shared cross-TP processing pool passed from AggKafkaConsumerService
+    this.crossTpProcessingPool = crossTpProcessingPool;
+    // Dedicated pool for parallel per-consumer batch unsubscription. Sized to the number of
+    // SharedKafkaConsumers since that's the maximum useful parallelism (each future acquires a
+    // different per-consumer lock; extra threads would just wait on locks).
+    this.batchUnsubscribeExecutor = Executors.newFixedThreadPool(
+        numOfConsumersPerKafkaCluster,
+        new DaemonThreadFactory("KafkaConsumerService-batch-unsub", serverConfig.getLogContext()));
     this.consumerToConsumptionTask = new IndexedHashMap<>(numOfConsumersPerKafkaCluster);
     this.aggStats = statsOverride != null
         ? statsOverride
@@ -138,7 +155,8 @@ public abstract class KafkaConsumerService extends AbstractKafkaConsumerService 
             kafkaClusterAlias,
             this::getMaxElapsedTimeMSSinceLastPollInConsumerPool,
             metadataRepository,
-            isUnregisterMetricForDeletedStoreEnabled);
+            isUnregisterMetricForDeletedStoreEnabled,
+            serverConfig.getClusterName());
 
     VeniceProperties properties = new VeniceProperties(consumerProperties);
     PubSubConsumerAdapterContext.Builder contextBuilder =
@@ -146,7 +164,8 @@ public abstract class KafkaConsumerService extends AbstractKafkaConsumerService 
             .setPubSubMessageDeserializer(pubSubContext.getPubSubMessageDeserializer())
             .setStoreChangeNotifier(pubSubContext.getStoreChangeNotifier())
             .setIsOffsetCollectionEnabled(isKafkaConsumerOffsetCollectionEnabled)
-            .setPubSubPositionTypeRegistry(serverConfig.getPubSubPositionTypeRegistry());
+            .setPubSubPositionTypeRegistry(serverConfig.getPubSubPositionTypeRegistry())
+            .setPubSubTopicRepository(pubSubContext.getPubSubTopicRepository());
     this.consumerPollTracker = new ConsumerPollTracker(time);
     PubSubConsumerAdapterFactory pubSubConsumerAdapterFactory =
         pubSubContext.getPubSubClientsFactory().getConsumerAdapterFactory();
@@ -159,7 +178,9 @@ public abstract class KafkaConsumerService extends AbstractKafkaConsumerService 
           pubSubConsumerAdapterFactory.create(contextBuilder.build()),
           aggStats,
           this::recordPartitionsPerConsumerSensor,
-          this::handleUnsubscription);
+          this::handleUnsubscription,
+          serverConfig.getRegionName(),
+          i);
 
       Supplier<Map<PubSubTopicPartition, List<DefaultPubSubMessage>>> pollFunction =
           liveConfigBasedKafkaThrottlingEnabled
@@ -189,7 +210,8 @@ public abstract class KafkaConsumerService extends AbstractKafkaConsumerService 
           recordsThrottlerFunction,
           this.aggStats,
           cleaner,
-          consumerPollTracker);
+          consumerPollTracker,
+          crossTpProcessingPool);
       consumerToConsumptionTask.putByIndex(pubSubConsumer, consumptionTask, i);
       consumerToLocks.put(pubSubConsumer, new ReentrantLock());
     }
@@ -198,7 +220,8 @@ public abstract class KafkaConsumerService extends AbstractKafkaConsumerService 
       this.inactiveTopicPartitionChecker = new InactiveTopicPartitionChecker(
           getConsumerToConsumptionTask(),
           serverConfig.getInactiveTopicPartitionCheckerInternalInSeconds(),
-          serverConfig.getInactiveTopicPartitionCheckerThresholdInSeconds());
+          serverConfig.getInactiveTopicPartitionCheckerThresholdInSeconds(),
+          serverConfig.getLogContext());
       LOGGER.info("Created InactiveTopicPartitionChecker for consumer pool type: {}", poolType);
     } else {
       this.inactiveTopicPartitionChecker = null;
@@ -257,7 +280,7 @@ public abstract class KafkaConsumerService extends AbstractKafkaConsumerService 
       if (topicPartitionToConsumerMap != null) {
         topicPartitionToConsumerMap.forEach((topicPartition, sharedConsumer) -> {
           /**
-           * Refer {@link KafkaConsumerService#startConsumptionIntoDataReceiver} for avoiding race condition caused by
+           * Refer {@link AbstractKafkaConsumerService#startConsumptionIntoDataReceiver} for avoiding race condition caused by
            * setting data receiver and unsubscribing concurrently for the same topic partition on a shared consumer.
            */
           try (AutoCloseableLock ignored = AutoCloseableLock.of(consumerToLocks.get(sharedConsumer))) {
@@ -279,7 +302,7 @@ public abstract class KafkaConsumerService extends AbstractKafkaConsumerService 
     SharedKafkaConsumer consumer = getConsumerAssignedToVersionTopicPartition(versionTopic, pubSubTopicPartition);
     if (consumer != null) {
       /**
-       * Refer {@link KafkaConsumerService#startConsumptionIntoDataReceiver} for avoiding race condition caused by
+       * Refer {@link AbstractKafkaConsumerService#startConsumptionIntoDataReceiver} for avoiding race condition caused by
        * setting data receiver and unsubscribing concurrently for the same topic partition on a shared consumer.
        */
       try (AutoCloseableLock ignored = AutoCloseableLock.of(consumerToLocks.get(consumer))) {
@@ -313,27 +336,47 @@ public abstract class KafkaConsumerService extends AbstractKafkaConsumerService 
     }
     /**
      * Leverage {@link PubSubConsumerAdapter#batchUnsubscribe(Set)}.
+     * Per-consumer locks are independent, so unsubscriptions on different SharedKafkaConsumers run
+     * in parallel. This reduces the total time from N_consumers × waitAfterUnsubscribe_timeout
+     * (sequential) to a single waitAfterUnsubscribe_timeout (parallel), which is critical for fast
+     * StoreIngestionTask shutdown.
      */
+    List<CompletableFuture<Void>> futures = new ArrayList<>(consumerUnSubTopicPartitionSet.size());
     consumerUnSubTopicPartitionSet.forEach((sharedConsumer, tpSet) -> {
-      ConsumptionTask task = consumerToConsumptionTask.get(sharedConsumer);
-      /**
-       * Refer {@link KafkaConsumerService#startConsumptionIntoDataReceiver} for avoiding race condition caused by
-       * setting data receiver and unsubscribing concurrently for the same topic partition on a shared consumer.
-       */
-      try (AutoCloseableLock ignored = AutoCloseableLock.of(consumerToLocks.get(sharedConsumer))) {
-        sharedConsumer.batchUnsubscribe(tpSet);
-        tpSet.forEach(task::removeDataReceiver);
-      }
-      tpSet.forEach(
-          tp -> versionTopicToTopicPartitionToConsumer.compute(versionTopic, (k, topicPartitionToConsumerMap) -> {
-            if (topicPartitionToConsumerMap != null) {
-              topicPartitionToConsumerMap.remove(tp);
-              return topicPartitionToConsumerMap.isEmpty() ? null : topicPartitionToConsumerMap;
-            } else {
-              return null;
-            }
-          }));
+      futures.add(CompletableFuture.runAsync(() -> {
+        ConsumptionTask task = consumerToConsumptionTask.get(sharedConsumer);
+        /**
+         * Refer {@link AbstractKafkaConsumerService#startConsumptionIntoDataReceiver} for avoiding race condition caused
+         * by setting data receiver and unsubscribing concurrently for the same topic partition on a shared consumer.
+         */
+        try (AutoCloseableLock ignored = AutoCloseableLock.of(consumerToLocks.get(sharedConsumer))) {
+          sharedConsumer.batchUnsubscribe(tpSet);
+          tpSet.forEach(task::removeDataReceiver);
+        }
+        tpSet.forEach(
+            tp -> versionTopicToTopicPartitionToConsumer.compute(versionTopic, (k, topicPartitionToConsumerMap) -> {
+              if (topicPartitionToConsumerMap != null) {
+                topicPartitionToConsumerMap.remove(tp);
+                return topicPartitionToConsumerMap.isEmpty() ? null : topicPartitionToConsumerMap;
+              } else {
+                return null;
+              }
+            }));
+      }, batchUnsubscribeExecutor));
     });
+    long timeoutMs = SharedKafkaConsumer.DEFAULT_MAX_WAIT_MS + TimeUnit.SECONDS.toMillis(5);
+    try {
+      CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(timeoutMs, TimeUnit.MILLISECONDS);
+    } catch (InterruptedException e) {
+      futures.forEach(f -> f.cancel(true));
+      Thread.currentThread().interrupt();
+    } catch (TimeoutException e) {
+      futures.forEach(f -> f.cancel(true));
+      LOGGER.warn("Batch unsubscribe for {} timed out after {}ms", versionTopic, timeoutMs, e);
+    } catch (ExecutionException e) {
+      futures.forEach(f -> f.cancel(true));
+      LOGGER.error("Batch unsubscribe for {} failed", versionTopic, e);
+    }
   }
 
   @Override
@@ -352,6 +395,8 @@ public abstract class KafkaConsumerService extends AbstractKafkaConsumerService 
     if (inactiveTopicPartitionChecker != null) {
       inactiveTopicPartitionChecker.stop();
     }
+    batchUnsubscribeExecutor.shutdownNow();
+    batchUnsubscribeExecutor.awaitTermination(SHUTDOWN_TIMEOUT_IN_SECOND, TimeUnit.SECONDS);
     consumerToConsumptionTask.values().forEach(ConsumptionTask::stop);
     long beginningTime = System.currentTimeMillis();
     boolean gracefulShutdownSuccess = consumerExecutor.awaitTermination(SHUTDOWN_TIMEOUT_IN_SECOND, TimeUnit.SECONDS);
@@ -377,6 +422,7 @@ public abstract class KafkaConsumerService extends AbstractKafkaConsumerService 
     beginningTime = System.currentTimeMillis();
     consumerToConsumptionTask.keySet().forEach(SharedKafkaConsumer::close);
     LOGGER.info("SharedKafkaConsumer closed in {} ms.", System.currentTimeMillis() - beginningTime);
+    // Note: crossTpProcessingPool shutdown is handled by AggKafkaConsumerService
   }
 
   @Override
@@ -394,14 +440,16 @@ public abstract class KafkaConsumerService extends AbstractKafkaConsumerService 
       String kafkaClusterAlias,
       LongSupplier getMaxElapsedTimeSinceLastPollInConsumerPool,
       ReadOnlyStoreRepository metadataRepository,
-      boolean isUnregisterMetricForDeletedStoreEnabled) {
+      boolean isUnregisterMetricForDeletedStoreEnabled,
+      String veniceClusterName) {
     String nameWithKafkaClusterAlias = "kafka_consumer_service_for_" + kafkaClusterAlias;
     return new AggKafkaConsumerServiceStats(
         nameWithKafkaClusterAlias,
         metricsRepository,
         metadataRepository,
         getMaxElapsedTimeSinceLastPollInConsumerPool,
-        isUnregisterMetricForDeletedStoreEnabled);
+        isUnregisterMetricForDeletedStoreEnabled,
+        veniceClusterName);
   }
 
   @Override
@@ -461,7 +509,8 @@ public abstract class KafkaConsumerService extends AbstractKafkaConsumerService 
   public void startConsumptionIntoDataReceiver(
       PartitionReplicaIngestionContext partitionReplicaIngestionContext,
       PubSubPosition lastReadPosition,
-      ConsumedDataReceiver<List<DefaultPubSubMessage>> consumedDataReceiver) {
+      ConsumedDataReceiver<List<DefaultPubSubMessage>> consumedDataReceiver,
+      boolean inclusive) {
     PubSubTopic versionTopic = consumedDataReceiver.destinationIdentifier();
     PubSubTopicPartition topicPartition = partitionReplicaIngestionContext.getPubSubTopicPartition();
     SharedKafkaConsumer consumer = assignConsumerFor(versionTopic, topicPartition);
@@ -489,7 +538,7 @@ public abstract class KafkaConsumerService extends AbstractKafkaConsumerService 
        * {@link KafkaConsumerService.ConsumptionTask} will not be able to funnel the messages.
        */
       consumptionTask.setDataReceiver(topicPartition, consumedDataReceiver);
-      consumer.subscribe(consumedDataReceiver.destinationIdentifier(), topicPartition, lastReadPosition);
+      consumer.subscribe(consumedDataReceiver.destinationIdentifier(), topicPartition, lastReadPosition, inclusive);
       consumerPollTracker.recordSubscribed(topicPartition);
     }
   }
@@ -526,7 +575,8 @@ public abstract class KafkaConsumerService extends AbstractKafkaConsumerService 
         ReadOnlyStoreRepository metadataRepository,
         boolean unregisterMetricForDeletedStoreEnabled,
         VeniceServerConfig serverConfig,
-        PubSubContext pubSubContext);
+        PubSubContext pubSubContext,
+        ExecutorService crossTpProcessingPool);
   }
 
   /**
@@ -544,6 +594,8 @@ public abstract class KafkaConsumerService extends AbstractKafkaConsumerService 
       totalPartitions += subscribedPartitionCount;
       minPartitionsPerConsumer = Math.min(minPartitionsPerConsumer, subscribedPartitionCount);
       maxPartitionsPerConsumer = Math.max(maxPartitionsPerConsumer, subscribedPartitionCount);
+      // Record raw per-consumer partition count to OTel histogram (asymmetric: Tehuti uses pre-computed gauges)
+      aggStats.recordTotalPartitionAssignmentForOtel(subscribedPartitionCount);
     }
     int avgPartitionsPerConsumer = totalPartitions / consumerToConsumptionTask.size();
 

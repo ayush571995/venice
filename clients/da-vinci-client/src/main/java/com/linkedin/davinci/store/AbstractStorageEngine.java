@@ -629,8 +629,7 @@ public abstract class AbstractStorageEngine<Partition extends AbstractStoragePar
   }
 
   /**
-   * Used in ingestion isolation mode update the storage engine's cache in sync with the updates to the state in
-   * {@link com.linkedin.davinci.ingestion.main.MainIngestionStorageMetadataService}
+   * Update the storage engine's store version state cache.
    */
   @Override
   public void updateStoreVersionStateCache(StoreVersionState versionState) {
@@ -668,6 +667,30 @@ public abstract class AbstractStorageEngine<Partition extends AbstractStoragePar
   public synchronized void clearStoreVersionState() {
     versionStateCache.set(null);
     metadataPartition.delete(VERSION_METADATA_KEY);
+  }
+
+  @Override
+  public synchronized void putGlobalRtDivMetadata(byte[] keyBytes, byte[] valueWithHeader) {
+    if (!metadataPartitionCreated()) {
+      throw new StorageInitializationException("Metadata partition not created!");
+    }
+    metadataPartition.put(keyBytes, valueWithHeader);
+  }
+
+  @Override
+  public synchronized byte[] getGlobalRtDivMetadata(byte[] keyBytes) {
+    if (!metadataPartitionCreated()) {
+      return null;
+    }
+    return metadataPartition.get(keyBytes);
+  }
+
+  @Override
+  public synchronized void deleteGlobalRtDivMetadata(byte[] keyBytes) {
+    if (!metadataPartitionCreated()) {
+      return;
+    }
+    metadataPartition.delete(keyBytes);
   }
 
   /**

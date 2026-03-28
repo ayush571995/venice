@@ -1,14 +1,12 @@
 package com.linkedin.venice;
 
 import static com.linkedin.venice.chunking.ChunkKeyValueTransformer.KeyType.WITH_VALUE_CHUNK;
-import static com.linkedin.venice.pubsub.PubSubUtil.getPubSubPositionString;
 
 import com.github.luben.zstd.Zstd;
 import com.linkedin.avroutil1.compatibility.AvroCompatibilityHelper;
 import com.linkedin.venice.chunking.ChunkKeyValueTransformer;
 import com.linkedin.venice.chunking.ChunkKeyValueTransformerImpl;
 import com.linkedin.venice.chunking.RawKeyBytesAndChunkedKeySuffix;
-import com.linkedin.venice.client.change.capture.protocol.RecordChangeEvent;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.compression.CompressorFactory;
 import com.linkedin.venice.compression.VeniceCompressor;
@@ -33,6 +31,7 @@ import com.linkedin.venice.meta.StoreInfo;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.pubsub.PubSubPositionDeserializer;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
+import com.linkedin.venice.pubsub.PubSubUtil;
 import com.linkedin.venice.pubsub.api.DefaultPubSubMessage;
 import com.linkedin.venice.pubsub.api.PubSubConsumerAdapter;
 import com.linkedin.venice.pubsub.api.PubSubPosition;
@@ -47,7 +46,6 @@ import com.linkedin.venice.utils.ByteUtils;
 import com.linkedin.venice.utils.DictionaryUtils;
 import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
-import com.linkedin.venice.views.ChangeCaptureView;
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -191,11 +189,6 @@ public class KafkaTopicDumper implements AutoCloseable {
     if (logMetadata && !logDataRecord) {
       this.latestValueSchemaStr = null;
       this.allValueSchemas = null;
-    } else if (topicPartition.getTopicName().contains(ChangeCaptureView.CHANGE_CAPTURE_TOPIC_SUFFIX)) {
-      // For now dump data record to console mode does not support change capture topic.
-      this.latestValueSchemaStr = RecordChangeEvent.getClassSchema().toString();
-      this.allValueSchemas = new Schema[1];
-      this.allValueSchemas[0] = RecordChangeEvent.getClassSchema();
     } else {
       MultiSchemaResponse.Schema[] schemas = controllerClient.getAllValueSchema(storeName).getSchemas();
       LOGGER.info("Found {} value schemas for store {}", schemas.length, storeName);
@@ -508,7 +501,10 @@ public class KafkaTopicDumper implements AutoCloseable {
           leaderMetadata == null ? "-" : leaderMetadata.hostName,
           leaderMetadata == null
               ? "-"
-              : getPubSubPositionString(pubSubPositionDeserializer, leaderMetadata.upstreamPubSubPosition),
+              : PubSubUtil.deserializePositionWithOffsetFallback(
+                  leaderMetadata.upstreamPubSubPosition,
+                  leaderMetadata.upstreamOffset,
+                  pubSubPositionDeserializer),
           leaderMetadata == null ? "-" : leaderMetadata.upstreamKafkaClusterId,
           chunkMetadata);
     } catch (Exception e) {
@@ -661,7 +657,10 @@ public class KafkaTopicDumper implements AutoCloseable {
         leaderMetadata == null ? "-" : leaderMetadata.hostName,
         leaderMetadata == null
             ? "-"
-            : getPubSubPositionString(pubSubPositionDeserializer, leaderMetadata.upstreamPubSubPosition),
+            : PubSubUtil.deserializePositionWithOffsetFallback(
+                leaderMetadata.upstreamPubSubPosition,
+                leaderMetadata.upstreamOffset,
+                pubSubPositionDeserializer),
         leaderMetadata == null ? "-" : leaderMetadata.upstreamKafkaClusterId);
   }
 

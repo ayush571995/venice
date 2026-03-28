@@ -1,10 +1,5 @@
 package com.linkedin.davinci.consumer;
 
-import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_BLOCK_CACHE_SIZE_IN_BYTES;
-import static com.linkedin.venice.ConfigKeys.DATA_BASE_PATH;
-import static com.linkedin.venice.ConfigKeys.PERSISTENCE_TYPE;
-import static com.linkedin.venice.ConfigKeys.PUSH_STATUS_STORE_ENABLED;
-import static com.linkedin.venice.meta.PersistenceType.ROCKS_DB;
 import static com.linkedin.venice.stats.dimensions.VeniceResponseStatusCategory.FAIL;
 import static com.linkedin.venice.stats.dimensions.VeniceResponseStatusCategory.SUCCESS;
 
@@ -17,20 +12,29 @@ import com.linkedin.davinci.client.SeekableDaVinciClient;
 import com.linkedin.davinci.client.StorageClass;
 import com.linkedin.davinci.client.factory.CachingDaVinciClientFactory;
 import com.linkedin.davinci.consumer.stats.BasicConsumerStats;
+import com.linkedin.venice.ConfigKeys;
+import com.linkedin.venice.acl.VeniceComponent;
 import com.linkedin.venice.annotation.VisibleForTesting;
 import com.linkedin.venice.client.exceptions.VeniceClientException;
 import com.linkedin.venice.client.store.ClientConfig;
+import com.linkedin.venice.exceptions.VeniceNoStoreException;
+import com.linkedin.venice.kafka.protocol.ControlMessage;
+import com.linkedin.venice.kafka.protocol.enums.ControlMessageType;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.pubsub.PubSubTopicImpl;
 import com.linkedin.venice.pubsub.PubSubTopicPartitionImpl;
 import com.linkedin.venice.pubsub.api.PubSubMessage;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
+import com.linkedin.venice.pubsub.api.PubSubSymbolicPosition;
 import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
 import com.linkedin.venice.utils.DaemonThreadFactory;
-import com.linkedin.venice.utils.PropertyBuilder;
+import com.linkedin.venice.utils.ExceptionUtils;
+import com.linkedin.venice.utils.LogContext;
 import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.VeniceProperties;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import com.linkedin.venice.utils.lazy.Lazy;
+import com.linkedin.venice.views.MaterializedView;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -38,7 +42,9 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedList;
 import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
@@ -78,26 +84,30 @@ public class VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>
   private final CountDownLatch startLatch = new CountDownLatch(1);
   // Using a dedicated thread pool for CompletableFutures created by this class to avoid potential thread starvation
   // issues in the default ForkJoinPool
-  private final ExecutorService completableFutureThreadPool =
-      Executors.newFixedThreadPool(1, new DaemonThreadFactory("VeniceChangelogConsumerDaVinciRecordTransformerImpl"));
+  private final ExecutorService completableFutureThreadPool;
 
   private final Set<Integer> subscribedPartitions = VeniceConcurrentHashMap.newKeySet();
+  private final Set<Integer> eopReceivedPartitions = VeniceConcurrentHashMap.newKeySet();
   private final ReentrantLock bufferLock = new ReentrantLock();
   private final Condition bufferIsFullCondition = bufferLock.newCondition();
-  private BackgroundReporterThread backgroundReporterThread;
-  private long backgroundReporterThreadSleepIntervalSeconds = 60L;
+  private volatile BackgroundReporterThread backgroundReporterThread;
   private final BasicConsumerStats changeCaptureStats;
   private final AtomicBoolean isCaughtUp = new AtomicBoolean(false);
-  private final ConcurrentHashMap<Integer, Long> currentVersionLastHeartbeat = new ConcurrentHashMap<>();
+  private final ConcurrentHashMap<Integer, Long> currentVersionLastHeartbeat = new VeniceConcurrentHashMap<>();
   private final VeniceConcurrentHashMap<Integer, AtomicLong> consumerSequenceIdGeneratorMap;
   private final long consumerSequenceIdStartingValue;
   private final boolean isVersionSpecificClient;
   private final VeniceChangelogConsumerClientFactory veniceChangelogConsumerClientFactory;
+  private final boolean includeControlMessages;
+  private final DaVinciConfig daVinciConfig;
+  private final String viewName;
+  private volatile boolean syntheticHeartbeatEnabled = false;
+  private volatile DaVinciRecordTransformerChangelogConsumer syntheticHeartbeatRecordTransformer;
 
   public VeniceChangelogConsumerDaVinciRecordTransformerImpl(
       ChangelogClientConfig changelogClientConfig,
       VeniceChangelogConsumerClientFactory veniceChangelogConsumerClientFactory) {
-    this(changelogClientConfig, System.nanoTime(), veniceChangelogConsumerClientFactory);
+    this(changelogClientConfig, Utils.getCurrentTimeInNanosForSeeding(), veniceChangelogConsumerClientFactory);
   }
 
   VeniceChangelogConsumerDaVinciRecordTransformerImpl(
@@ -106,13 +116,22 @@ public class VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>
       VeniceChangelogConsumerClientFactory veniceChangelogConsumerClientFactory) {
     this.changelogClientConfig = changelogClientConfig;
     this.storeName = changelogClientConfig.getStoreName();
-    DaVinciConfig daVinciConfig = new DaVinciConfig();
-    daVinciConfig.setStorageClass(StorageClass.DISK);
+    String cdcComponentName = changelogClientConfig.isStateful()
+        ? VeniceComponent.DVRT_STATEFUL_CDC.name()
+        : VeniceComponent.DVRT_STATELESS_CDC.name();
+    this.completableFutureThreadPool = Executors.newFixedThreadPool(
+        1,
+        new DaemonThreadFactory(
+            "VeniceChangelogConsumerDaVinciRecordTransformerImpl",
+            LogContext.newBuilder().setComponentName(cdcComponentName).build()));
+    this.daVinciConfig = new DaVinciConfig();
+    this.daVinciConfig.setStorageClass(StorageClass.DISK);
     ClientConfig innerClientConfig = changelogClientConfig.getInnerClientConfig();
     this.pubSubMessages = new ArrayBlockingQueue<>(changelogClientConfig.getMaxBufferSize());
-    this.partitionToVersionToServe = new ConcurrentHashMap<>();
+    this.partitionToVersionToServe = new VeniceConcurrentHashMap<>();
     this.isVersionSpecificClient = changelogClientConfig.getStoreVersion() != null;
     this.veniceChangelogConsumerClientFactory = veniceChangelogConsumerClientFactory;
+    this.viewName = changelogClientConfig.getViewName();
 
     recordTransformerConfig = new DaVinciRecordTransformerConfig.Builder()
         .setRecordTransformerFunction(DaVinciRecordTransformerChangelogConsumer::new)
@@ -129,27 +148,38 @@ public class VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>
         .setStoreRecordsInDaVinci(changelogClientConfig.isStateful())
         .setRecordMetadataEnabled(true)
         .build();
-    daVinciConfig.setRecordTransformerConfig(recordTransformerConfig);
+    this.daVinciConfig.setRecordTransformerConfig(recordTransformerConfig);
+
+    Properties consumerProps = new Properties();
+    consumerProps.putAll(changelogClientConfig.getConsumerProperties());
+    consumerProps.setProperty(ConfigKeys.VENICE_LOG_CONTEXT_COMPONENT, cdcComponentName);
 
     this.daVinciClientFactory = new CachingDaVinciClientFactory(
         changelogClientConfig.getD2Client(),
         changelogClientConfig.getD2ServiceName(),
         innerClientConfig.getMetricsRepository(),
-        buildVeniceConfig());
+        new VeniceProperties(consumerProps));
 
     if (isVersionSpecificClient) {
       LOGGER.info(
           "Version specific CDC client is in use. Subscribing to version: {} for store: {}",
           changelogClientConfig.getStoreVersion(),
           storeName);
-      this.daVinciClient = this.daVinciClientFactory
-          .getVersionSpecificGenericAvroClient(this.storeName, changelogClientConfig.getStoreVersion(), daVinciConfig);
+      this.daVinciClient = this.daVinciClientFactory.getVersionSpecificGenericAvroClient(
+          this.storeName,
+          changelogClientConfig.getStoreVersion(),
+          this.viewName,
+          daVinciConfig);
     } else {
       if (innerClientConfig.isSpecificClient()) {
-        this.daVinciClient = this.daVinciClientFactory
-            .getSpecificSeekableAvroClient(this.storeName, daVinciConfig, innerClientConfig.getSpecificValueClass());
+        this.daVinciClient = this.daVinciClientFactory.getSpecificSeekableAvroClient(
+            this.storeName,
+            this.viewName,
+            daVinciConfig,
+            innerClientConfig.getSpecificValueClass());
       } else {
-        this.daVinciClient = this.daVinciClientFactory.getGenericSeekableAvroClient(this.storeName, daVinciConfig);
+        this.daVinciClient =
+            this.daVinciClientFactory.getGenericSeekableAvroClient(this.storeName, this.viewName, daVinciConfig);
       }
     }
 
@@ -163,9 +193,10 @@ public class VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>
     }
     this.consumerSequenceIdGeneratorMap = new VeniceConcurrentHashMap<>();
     this.consumerSequenceIdStartingValue = consumerSequenceIdStartingValue;
+    this.includeControlMessages = changelogClientConfig.shouldIncludeControlMessages();
   }
 
-  private void startDaVinciClient() {
+  private synchronized void startDaVinciClient() {
     // Start daVinci client if not already started
     if (!isStarted.get()) {
       daVinciClient.start();
@@ -181,79 +212,100 @@ public class VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>
    * @param subscriptionCall Function that takes subscribedPartitions and returns subscription future
    * @return CompletableFuture that represents the async initialization work
    */
-  private CompletableFuture<Void> initializeAndSubscribe(
+  private synchronized CompletableFuture<Void> initializeAndSubscribe(
       Set<Integer> partitions,
       Function<Set<Integer>, CompletableFuture<Void>> subscriptionCall) {
-    startDaVinciClient();
-
-    // If a user passes in empty partitions set, we subscribe to all partitions
     Set<Integer> targetPartitions = new HashSet<>();
-    if (partitions.isEmpty()) {
-      for (int i = 0; i < daVinciClient.getPartitionCount(); i++) {
-        targetPartitions.add(i);
+    boolean partitionsAdded = false;
+    try {
+      startDaVinciClient();
+
+      // If a user passes in empty partitions set, we subscribe to all partitions
+      if (partitions.isEmpty()) {
+        for (int i = 0; i < daVinciClient.getPartitionCount(); i++) {
+          targetPartitions.add(i);
+        }
+      } else {
+        targetPartitions.addAll(partitions);
       }
-    } else {
-      targetPartitions.addAll(partitions);
-    }
 
-    // Explicitly don't allow seeking to an already subscribed partition, as DaVinci doesn't support it
-    Set<Integer> intersection = new HashSet<>(subscribedPartitions);
-    intersection.retainAll(targetPartitions);
-    if (!intersection.isEmpty()) {
-      throw new VeniceClientException(
-          "Cannot subscribe to partitions: " + intersection + " as they are already subscribed");
-    }
+      // Explicitly don't allow seeking to an already subscribed partition, as DaVinci doesn't support it
+      Set<Integer> intersection = new HashSet<>(subscribedPartitions);
+      intersection.retainAll(targetPartitions);
+      if (!intersection.isEmpty()) {
+        throw new VeniceClientException(
+            "Cannot subscribe to partitions: " + intersection + " as they are already subscribed");
+      }
 
-    subscribedPartitions.addAll(targetPartitions);
+      subscribedPartitions.addAll(targetPartitions);
+      partitionsAdded = true;
 
-    CompletableFuture<Void> startFuture = CompletableFuture.supplyAsync(() -> {
-      try {
-        /*
-         * When this latch gets released, this means there's at least one message in pubSubMessages. So when the user
-         * calls poll, they don't get an empty response. This also signals that blob transfer was completed
-         * for at least one partition.
-         */
-        if (!startLatch.await(START_TIMEOUT_IN_SECONDS, TimeUnit.SECONDS)) {
-          LOGGER.warn(
-              "Unable to consume a message after {} seconds for store: {}. Moving on to unblock start.",
-              START_TIMEOUT_IN_SECONDS,
-              storeName);
+      /*
+       * Invoke subscriptionCall before scheduling startFuture. If it throws synchronously
+       * (e.g. retired version), we avoid scheduling startFuture which would otherwise wait
+       * on startLatch for START_TIMEOUT_IN_SECONDS with no ingestion to count it down.
+       *
+       * Avoid waiting on the returned CompletableFuture to prevent a circular dependency.
+       * When subscribe is called, DVRT scans the entire storage engine and fills pubSubMessages.
+       * Because pubSubMessages has limited capacity, blocking on the CompletableFuture
+       * prevents the user from calling poll to drain pubSubMessages, so the threads populating
+       * pubSubMessages will wait forever for capacity to become available.
+       */
+      CompletableFuture<Void> subscriptionFuture = subscriptionCall.apply(targetPartitions);
+
+      CompletableFuture<Void> startFuture = CompletableFuture.supplyAsync(() -> {
+        try {
+          /*
+           * When this latch gets released, this means there's at least one message in pubSubMessages. So when the user
+           * calls poll, they don't get an empty response. This also signals that blob transfer was completed
+           * for at least one partition.
+           */
+          if (!startLatch.await(START_TIMEOUT_IN_SECONDS, TimeUnit.SECONDS)) {
+            LOGGER.warn(
+                "Unable to consume a message after {} seconds for store: {}. Moving on to unblock start.",
+                START_TIMEOUT_IN_SECONDS,
+                storeName);
+          }
+
+          if (changeCaptureStats != null) {
+            backgroundReporterThread = new BackgroundReporterThread();
+            backgroundReporterThread.start();
+          }
+        } catch (InterruptedException e) {
+          LOGGER.info("Thread was interrupted", e);
+          // Restore the interrupt status
+          Thread.currentThread().interrupt();
+        }
+        return null;
+      }, completableFutureThreadPool);
+
+      subscriptionFuture.whenComplete((result, error) -> {
+        if (error != null) {
+          LOGGER.error("Failed to subscribe to partitions: {} for store: {}", targetPartitions, storeName, error);
+          subscribedPartitions.removeAll(targetPartitions);
+          startFuture.completeExceptionally(new VeniceClientException(error));
+          return;
         }
 
-        if (changeCaptureStats != null) {
-          backgroundReporterThread = new BackgroundReporterThread();
-          backgroundReporterThread.start();
-        }
-      } catch (InterruptedException e) {
-        LOGGER.info("Thread was interrupted", e);
-        // Restore the interrupt status
-        Thread.currentThread().interrupt();
+        isCaughtUp.set(true);
+        LOGGER.info(
+            "VeniceChangelogConsumer is caught up for store: {} for partitions: {}",
+            storeName,
+            subscribedPartitions);
+      });
+
+      return startFuture;
+    } catch (Exception e) {
+      if (isVersionSpecificClient && isStoreOrVersionNotFoundException(e)) {
+        LOGGER.warn("Store or version no longer exists for store: {}. Marking as caught up.", storeName, e);
+        isCaughtUp.set(true);
+        return CompletableFuture.completedFuture(null);
       }
-      return null;
-    }, completableFutureThreadPool);
-
-    /*
-     * Avoid waiting on the CompletableFuture to prevent a circular dependency.
-     * When subscribe is called, DVRT scans the entire storage engine and fills pubSubMessages.
-     * Because pubSubMessages has limited capacity, blocking on the CompletableFuture
-     * prevents the user from calling poll to drain pubSubMessages, so the threads populating pubSubMessages
-     * will wait forever for capacity to become available. This leads to a deadlock.
-    */
-    subscriptionCall.apply(subscribedPartitions).whenComplete((result, error) -> {
-      if (error != null) {
-        LOGGER.error("Failed to subscribe to partitions: {} for store: {}", subscribedPartitions, storeName, error);
-        startFuture.completeExceptionally(new VeniceClientException(error));
-        return;
+      if (partitionsAdded) {
+        subscribedPartitions.removeAll(targetPartitions);
       }
-
-      isCaughtUp.set(true);
-      LOGGER.info(
-          "VeniceChangelogConsumer is caught up for store: {} for partitions: {}",
-          storeName,
-          subscribedPartitions);
-    });
-
-    return startFuture;
+      throw e;
+    }
   }
 
   // StatefulVeniceChangelogConsumer methods below
@@ -291,8 +343,7 @@ public class VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>
   }
 
   public CompletableFuture<Void> subscribe(Set<Integer> partitions) {
-    // ToDo: Start at beginning of topic
-    return this.start(partitions);
+    return this.seekToBeginningOfPush(partitions);
   }
 
   public CompletableFuture<Void> subscribeAll() {
@@ -310,11 +361,11 @@ public class VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>
   }
 
   public CompletableFuture<Void> seekToBeginningOfPush(Set<Integer> partitions) {
-    return this.subscribe(partitions);
+    return initializeAndSubscribe(partitions, daVinciClient::seekToBeginningOfPush);
   }
 
   public CompletableFuture<Void> seekToBeginningOfPush() {
-    return this.subscribe(Collections.emptySet());
+    return this.seekToBeginningOfPush(Collections.emptySet());
   }
 
   public CompletableFuture<Void> seekToEndOfPush(Set<Integer> partitions) {
@@ -326,8 +377,12 @@ public class VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>
   }
 
   public CompletableFuture<Void> seekToTail(Set<Integer> partitions) {
-    // ToDo: Seek to latest
-    throw new VeniceClientException("seekToTail is not supported yet");
+    CompletableFuture<Void> future = initializeAndSubscribe(partitions, daVinciClient::seekToTail);
+    // seekToTail positions all target partitions at LATEST, which is past EOP for batch stores.
+    // Use subscribedPartitions if partitions was empty (meaning all), otherwise use the explicit set.
+    eopReceivedPartitions.addAll(partitions.isEmpty() ? subscribedPartitions : partitions);
+    maybeEnableSyntheticHeartbeats();
+    return future;
   }
 
   public CompletableFuture<Void> seekToTail() {
@@ -335,13 +390,20 @@ public class VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>
   }
 
   public CompletableFuture<Void> seekToCheckpoint(Set<VeniceChangeCoordinate> checkpoints) {
-    // Extract partitions from checkpoints
+    // Extract partitions from checkpoints, and mark partitions with LATEST position as past-EOP
     Set<Integer> partitions = new HashSet<>();
     for (VeniceChangeCoordinate coordinate: checkpoints) {
-      partitions.add(coordinate.getPartition());
+      int partition = coordinate.getPartition();
+      partitions.add(partition);
+      if (PubSubSymbolicPosition.LATEST.equals(coordinate.getPosition())) {
+        eopReceivedPartitions.add(partition);
+      }
     }
 
-    return initializeAndSubscribe(partitions, ignore -> daVinciClient.seekToCheckpoint(checkpoints));
+    CompletableFuture<Void> future =
+        initializeAndSubscribe(partitions, ignore -> daVinciClient.seekToCheckpoint(checkpoints));
+    maybeEnableSyntheticHeartbeats();
+    return future;
   }
 
   public CompletableFuture<Void> seekToTimestamps(Map<Integer, Long> timestamps) {
@@ -410,18 +472,11 @@ public class VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>
       int messagesPolled = drainedPubSubMessages.size();
 
       if (changelogClientConfig.shouldCompactMessages()) {
-        Map<K, PubSubMessage<K, ChangeEvent<V>, VeniceChangeCoordinate>> tempMap = new LinkedHashMap<>();
-        /*
-         * The behavior of LinkedHashMap is such that it maintains the order of insertion, but for values which are
-         * replaced, it's put in at the position of the first insertion. This isn't quite what we want, we want to keep
-         * only a single key (just as a map would), but we want to keep the position of the last insertion as well. So in
-         * order to do that, we remove the entry before inserting it.
-         */
-        for (PubSubMessage<K, ChangeEvent<V>, VeniceChangeCoordinate> message: drainedPubSubMessages) {
-          tempMap.remove(message.getKey());
-          tempMap.put(message.getKey(), message);
+        if (includeControlMessages) {
+          drainedPubSubMessages = compactPubSubMessagesWithControlMessage(drainedPubSubMessages);
+        } else {
+          drainedPubSubMessages = compactPubSubMessages(drainedPubSubMessages);
         }
-        drainedPubSubMessages = tempMap.values();
       }
 
       if (changeCaptureStats != null) {
@@ -445,19 +500,58 @@ public class VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>
     return isCaughtUp.get();
   }
 
-  private VeniceProperties buildVeniceConfig() {
-    return new PropertyBuilder().put(changelogClientConfig.getConsumerProperties())
-        // We don't need the block cache, since we only read each key once from disk
-        .put(ROCKSDB_BLOCK_CACHE_SIZE_IN_BYTES, 0)
-        .put(DATA_BASE_PATH, changelogClientConfig.getBootstrapFileSystemPath())
-        .put(PERSISTENCE_TYPE, ROCKS_DB)
-        .put(PUSH_STATUS_STORE_ENABLED, !isVersionSpecificClient)
-        .build();
+  /**
+   * Compacts the given collection of PubSubMessages by retaining only the latest message for each unique key.
+   * This method assumes that there is no control message (with key=null and value=null) in the input collection.
+   */
+  private Collection<PubSubMessage<K, ChangeEvent<V>, VeniceChangeCoordinate>> compactPubSubMessages(
+      Collection<PubSubMessage<K, ChangeEvent<V>, VeniceChangeCoordinate>> messages) {
+    Map<K, PubSubMessage<K, ChangeEvent<V>, VeniceChangeCoordinate>> tempMap = new LinkedHashMap<>();
+    /*
+     * The behavior of LinkedHashMap is such that it maintains the order of insertion, but for values which are
+     * replaced, it's put in at the position of the first insertion. This isn't quite what we want, we want to keep
+     * only a single key (just as a map would), but we want to keep the position of the last insertion as well. So in
+     * order to do that, we remove the entry before inserting it.
+     */
+    for (PubSubMessage<K, ChangeEvent<V>, VeniceChangeCoordinate> message: messages) {
+      tempMap.remove(message.getKey());
+      tempMap.put(message.getKey(), message);
+    }
+    return tempMap.values();
+  }
+
+  /**
+   * Compacts the given collection of PubSubMessages by retaining only the latest message for each unique key,
+   * while preserving control messages (with key=null and value=null).
+   * This method will use more memory compared to compactPubSubMessages since it duplicates the input collection.
+   */
+  private Collection<PubSubMessage<K, ChangeEvent<V>, VeniceChangeCoordinate>> compactPubSubMessagesWithControlMessage(
+      Collection<PubSubMessage<K, ChangeEvent<V>, VeniceChangeCoordinate>> messages) {
+    Set<K> seenKeys = new HashSet<>();
+    LinkedList<PubSubMessage<K, ChangeEvent<V>, VeniceChangeCoordinate>> compactedMessageList = new LinkedList<>();
+    // Iterate in reverse order to keep the latest message for each key
+    ArrayList<PubSubMessage<K, ChangeEvent<V>, VeniceChangeCoordinate>> messageList = new ArrayList<>(messages);
+    for (int i = messageList.size() - 1; i >= 0; i--) {
+      PubSubMessage<K, ChangeEvent<V>, VeniceChangeCoordinate> message = messageList.get(i);
+      K key = message.getKey();
+      if (key == null || !seenKeys.contains(key)) {
+        compactedMessageList.addFirst(message);
+        if (key != null) {
+          seenKeys.add(key);
+        }
+      }
+    }
+    return compactedMessageList;
   }
 
   @VisibleForTesting
   public DaVinciRecordTransformerConfig getRecordTransformerConfig() {
     return recordTransformerConfig;
+  }
+
+  @VisibleForTesting
+  public DaVinciConfig getDaVinciConfig() {
+    return daVinciConfig;
   }
 
   class BackgroundReporterThread extends Thread {
@@ -472,7 +566,7 @@ public class VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>
       while (!Thread.interrupted()) {
         try {
           recordStats();
-          TimeUnit.SECONDS.sleep(backgroundReporterThreadSleepIntervalSeconds);
+          TimeUnit.SECONDS.sleep(changelogClientConfig.getBackgroundReporterThreadSleepIntervalInSeconds());
         } catch (InterruptedException e) {
           LOGGER.warn("BackgroundReporterThread interrupted!  Shutting down...", e);
           Thread.currentThread().interrupt(); // Restore the interrupt status
@@ -482,8 +576,23 @@ public class VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>
     }
 
     private void recordStats() {
-      // Emit heartbeat delay metrics based on last heartbeat per partition
+      // For version-specific clients subscribed to batch stores, emit synthetic heartbeats per partition
+      // once that partition is past EOP. Batch stores don't have real-time topics, so the server never
+      // emits heartbeats. Synthetic heartbeats ensure consumers monitoring heartbeat lag see progress.
       long now = System.currentTimeMillis();
+      if (syntheticHeartbeatEnabled && syntheticHeartbeatRecordTransformer != null) {
+        for (int partitionId: new HashSet<>(eopReceivedPartitions)) {
+          if (subscribedPartitions.contains(partitionId)) {
+            syntheticHeartbeatRecordTransformer.onHeartbeat(partitionId, now);
+            ControlMessage heartbeatControlMessage = new ControlMessage();
+            heartbeatControlMessage.setControlMessageType(ControlMessageType.START_OF_SEGMENT.getValue());
+            syntheticHeartbeatRecordTransformer
+                .onControlMessage(partitionId, PubSubSymbolicPosition.LATEST, heartbeatControlMessage, now);
+          }
+        }
+      }
+
+      // Emit heartbeat delay metrics based on last heartbeat per partition
       long maxLag = Long.MIN_VALUE;
       for (Long heartBeatTimestamp: getLastHeartbeatPerPartition().values()) {
         if (heartBeatTimestamp != null) {
@@ -518,13 +627,30 @@ public class VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>
   }
 
   @VisibleForTesting
-  protected void setBackgroundReporterThreadSleepIntervalSeconds(long interval) {
-    backgroundReporterThreadSleepIntervalSeconds = interval;
+  protected boolean isSyntheticHeartbeatEnabled() {
+    return syntheticHeartbeatEnabled;
+  }
+
+  private void maybeEnableSyntheticHeartbeats() {
+    if (!syntheticHeartbeatEnabled && isVersionSpecificClient && isStarted.get() && !daVinciClient.isHybrid()) {
+      syntheticHeartbeatEnabled = true;
+      LOGGER.info(
+          "Enabling synthetic heartbeats for batch store: {}, version: {}, partitions past EOP: {}",
+          storeName,
+          changelogClientConfig.getStoreVersion(),
+          eopReceivedPartitions);
+    }
+  }
+
+  private static boolean isStoreOrVersionNotFoundException(Throwable error) {
+    // Store deleted: VeniceNoStoreException
+    // Version retired: StoreVersionNotFoundException (extends VeniceNoStoreException)
+    return ExceptionUtils.recursiveClassEquals(error, VeniceNoStoreException.class);
   }
 
   public class DaVinciRecordTransformerChangelogConsumer extends DaVinciRecordTransformer<K, V, V> {
     private final String topicName;
-    private final Map<Integer, PubSubTopicPartition> pubSubTopicPartitionMap = new HashMap<>();
+    private final Map<Integer, PubSubTopicPartition> pubSubTopicPartitionMap = new VeniceConcurrentHashMap<>();
 
     public DaVinciRecordTransformerChangelogConsumer(
         String storeName,
@@ -534,11 +660,23 @@ public class VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>
         Schema outputValueSchema,
         DaVinciRecordTransformerConfig recordTransformerConfig) {
       super(storeName, storeVersion, keySchema, inputValueSchema, outputValueSchema, recordTransformerConfig);
-      this.topicName = Version.composeKafkaTopic(changelogClientConfig.getStoreName(), getStoreVersion());
+
+      // Determine the topic name based on whether a view name is provided
+      if (viewName != null && !viewName.isEmpty() && getViewClass().equals(MaterializedView.class.getCanonicalName())) {
+        this.topicName =
+            MaterializedView.composeTopicName(changelogClientConfig.getStoreName(), getStoreVersion(), viewName);
+      } else {
+        this.topicName = Version.composeKafkaTopic(changelogClientConfig.getStoreName(), getStoreVersion());
+      }
     }
 
     @Override
     public void onStartVersionIngestion(int partitionId, boolean isCurrentVersion) {
+      // Store reference for synthetic heartbeat emission. Set here because the inner class instance
+      // is created via ::new and not directly accessible from the outer class.
+      if (syntheticHeartbeatRecordTransformer == null) {
+        syntheticHeartbeatRecordTransformer = this;
+      }
       if (isCurrentVersion || isVersionSpecificClient) {
         /*
          * This condition can occur when the application is starting up (due to a restart/deployment) or when the
@@ -574,6 +712,9 @@ public class VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>
       return new DaVinciRecordTransformerResult<>(DaVinciRecordTransformerResult.Result.UNCHANGED);
     }
 
+    /**
+     * Add ChangeCapturePubSubMessage to the buffer based on record metadata.
+     */
     public void addMessageToBuffer(
         K key,
         V value,
@@ -581,45 +722,97 @@ public class VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>
         DaVinciRecordTransformerRecordMetadata recordMetadata) {
       if (partitionToVersionToServe.get(partitionId) == getStoreVersion()) {
         ChangeEvent<V> changeEvent = new ChangeEvent<>(null, value);
-        try {
-          pubSubMessages.put(
-              new ImmutableChangeCapturePubSubMessage<>(
-                  key,
-                  changeEvent,
-                  pubSubTopicPartitionMap.get(partitionId),
-                  recordMetadata.getPubSubPosition(),
-                  recordMetadata.getTimestamp(),
-                  recordMetadata.getPayloadSize(),
-                  isCaughtUp(),
-                  getNextConsumerSequenceId(partitionId),
-                  recordMetadata.getWriterSchemaId(),
-                  recordMetadata.getReplicationMetadataPayload()));
-
-          /*
-           * pubSubMessages is full, signal to a poll thread awaiting on bufferFullCondition.
-           * Not signaling to all threads, because if multiple poll threads try to read pubSubMessages at
-           * the same time, all other poll threads besides the first reader will get any messages.
-           * Also, don't acquire the locker before inserting into pubSubMessages. If we acquire the lock before,
-           * and pubSubMessages is full, the put will be blocked, and we won't be able to release the lock. Leading
-           * to a deadlock. We also shouldn't signal before insertion either, because when the buffer is full multiple
-           * drainer threads will send a signal out at once. This leads to the original issue described at the
-           * beginning of this comment block.
-           */
-          if (pubSubMessages.remainingCapacity() == 0) {
-            bufferLock.lock();
-            try {
-              bufferIsFullCondition.signal();
-            } finally {
-              bufferLock.unlock();
-            }
-          }
-
-          startLatch.countDown();
-        } catch (InterruptedException e) {
-          LOGGER.error("Thread was interrupted while putting a message into pubSubMessages", e);
-          Thread.currentThread().interrupt();
-        }
+        ImmutableChangeCapturePubSubMessage<K, ChangeEvent<V>> pubSubMessage =
+            new ImmutableChangeCapturePubSubMessage<>(
+                key,
+                changeEvent,
+                pubSubTopicPartitionMap.get(partitionId),
+                recordMetadata.getPubSubPosition(),
+                recordMetadata.getTimestamp(),
+                recordMetadata.getPayloadSize(),
+                isCaughtUp(),
+                getNextConsumerSequenceId(partitionId),
+                recordMetadata.getWriterSchemaId(),
+                recordMetadata.getReplicationMetadataPayload(),
+                null);
+        internalAddMessageToBuffer(partitionId, pubSubMessage);
       }
+    }
+
+    /**
+     * Add ControlMessage to the buffer.
+     * Key and Value are both null. Details for control message are in controlMessage param.
+     */
+    public void addControlMessageToBuffer(
+        int partitionId,
+        PubSubPosition offset,
+        ControlMessage controlMessage,
+        long pubSubMessageTimestamp) {
+      if (partitionToVersionToServe.get(partitionId) == getStoreVersion()) {
+        ImmutableChangeCapturePubSubMessage<K, ChangeEvent<V>> pubSubMessage =
+            new ImmutableChangeCapturePubSubMessage<>(
+                null,
+                null,
+                pubSubTopicPartitionMap.get(partitionId),
+                offset,
+                pubSubMessageTimestamp,
+                0,
+                false,
+                getNextConsumerSequenceId(partitionId),
+                -1,
+                null,
+                controlMessage);
+        internalAddMessageToBuffer(partitionId, pubSubMessage);
+      }
+    }
+
+    /**
+     * Internal method to add message to buffer.
+     */
+    private void internalAddMessageToBuffer(
+        int partitionId,
+        ImmutableChangeCapturePubSubMessage<K, ChangeEvent<V>> pubSubMessage) {
+      if (partitionToVersionToServe.get(partitionId) != getStoreVersion()) {
+        return;
+      }
+
+      try {
+        pubSubMessages.put(pubSubMessage);
+        /*
+         * pubSubMessages is full, signal to a poll thread awaiting on bufferFullCondition.
+         * Not signaling to all threads, because if multiple poll threads try to read pubSubMessages at
+         * the same time, all other poll threads besides the first reader will get any messages.
+         * Also, don't acquire the locker before inserting into pubSubMessages. If we acquire the lock before,
+         * and pubSubMessages is full, the put will be blocked, and we won't be able to release the lock. Leading
+         * to a deadlock. We also shouldn't signal before insertion either, because when the buffer is full multiple
+         * drainer threads will send a signal out at once. This leads to the original issue described at the
+         * beginning of this comment block.
+         */
+        if (pubSubMessages.remainingCapacity() == 0) {
+          bufferLock.lock();
+          try {
+            bufferIsFullCondition.signal();
+          } finally {
+            bufferLock.unlock();
+          }
+        }
+
+        startLatch.countDown();
+      } catch (InterruptedException e) {
+        LOGGER.error("Thread was interrupted while putting a message into pubSubMessages", e);
+        Thread.currentThread().interrupt();
+      }
+    }
+
+    /**
+     * Helper method to get the view class based on the view name and store configuration.
+     */
+    private String getViewClass() {
+      return veniceChangelogConsumerClientFactory.viewClassGetter.apply(
+          changelogClientConfig.getStoreName(),
+          viewName,
+          changelogClientConfig.getD2ControllerClient(),
+          changelogClientConfig.getControllerRequestRetryCount());
     }
 
     private long getNextConsumerSequenceId(int partition) {
@@ -642,6 +835,27 @@ public class VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>
       // When value is null, it indicates it's a delete
       addMessageToBuffer(key.get(), null, partitionId, recordMetadata);
     };
+
+    /**
+     * If includeControlMessages is FALSE, or the client is NOT version specific, this method is a no-op.
+     * If includeControlMessages is true, AND the client is version specific, it adds the control message to the buffer.
+     */
+    public void onControlMessage(
+        int partitionId,
+        PubSubPosition offset,
+        ControlMessage controlMessage,
+        long pubSubMessageTimestamp) {
+      // Track EOP per partition to enable synthetic heartbeats for batch stores.
+      // This runs before the includeControlMessages gate since it's internal state tracking.
+      if (controlMessage.getControlMessageType() == ControlMessageType.END_OF_PUSH.getValue()) {
+        eopReceivedPartitions.add(partitionId);
+        maybeEnableSyntheticHeartbeats();
+      }
+      if (!isVersionSpecificClient || !includeControlMessages) {
+        return;
+      }
+      addControlMessageToBuffer(partitionId, offset, controlMessage, pubSubMessageTimestamp);
+    }
 
     public void onVersionSwap(int currentVersion, int futureVersion, int partitionId) {
       /*
@@ -718,11 +932,14 @@ public class VeniceChangelogConsumerDaVinciRecordTransformerImpl<K, V>
       subscribedPartitions.clear();
       partitionToVersionToServe.clear();
       currentVersionLastHeartbeat.clear();
+      eopReceivedPartitions.clear();
+      syntheticHeartbeatEnabled = false;
     } else {
       for (int partition: partitions) {
         subscribedPartitions.remove(partition);
         partitionToVersionToServe.remove(partition);
         currentVersionLastHeartbeat.remove(partition);
+        eopReceivedPartitions.remove(partition);
       }
     }
   }

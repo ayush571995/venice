@@ -107,7 +107,53 @@ public final class VenicePushJobConstants {
    */
   public static final String KAFKA_INPUT_TOPIC = "kafka.input.topic";
   public static final String KAFKA_INPUT_FABRIC = "kafka.input.fabric";
+  /**
+   * @deprecated Use {@link #VENICE_REPUSH_SOURCE_PUBSUB_BROKER} instead.
+   */
+  @Deprecated
   public static final String KAFKA_INPUT_BROKER_URL = "kafka.input.broker.url";
+
+  /**
+   * PubSub broker URL for the push destination — the Kafka cluster where new version data is
+   * produced. Set from {@code VersionCreationResponse.getKafkaBootstrapServers()}, which returns
+   * the NR (Native Replication) source region's broker. In cross-fabric repush (e.g., input from
+   * dc-1, NR source dc-0), this points to dc-0 — the cluster that receives the new version data.
+   *
+   * <p>This key is set in the global Spark/MR job config by {@code AbstractDataWriterSparkJob} and
+   * {@code DataWriterMRJob}. Neither {@code PUBSUB_BROKER_ADDRESS} nor {@code KAFKA_BOOTSTRAP_SERVERS}
+   * is set in the global config. Instead, at the task level:
+   * <ul>
+   *   <li>{@code AbstractPartitionWriter.configureTask()} resolves this to {@code PUBSUB_BROKER_ADDRESS}
+   *       for {@code VeniceWriterFactory} and {@code DictionaryUtils} (ZSTD dict read from dest topic).</li>
+   *   <li>{@code AbstractInputRecordProcessor.configureTask()} does the same for mapper-side ZSTD dict.</li>
+   *   <li>{@code VeniceKafkaInputReducer} reads this for the destination compressor.</li>
+   * </ul>
+   *
+   * @see #VENICE_REPUSH_SOURCE_PUBSUB_BROKER the "input/source" broker for KIF repush reads
+   */
+  public static final String VENICE_PUSH_DESTINATION_PUBSUB_BROKER = "venice.push.destination.pubsub.broker";
+
+  /**
+   * PubSub broker URL for the repush input source — the Kafka cluster from which existing version
+   * topic data is consumed during a KIF repush. Set from {@code RepushInfoResponse.getKafkaBrokerUrl()}
+   * (which resolves {@code KAFKA_INPUT_FABRIC} to a broker URL). In cross-fabric repush (e.g., input
+   * from dc-1, NR source dc-0), this points to dc-1 — the cluster that holds the source version data.
+   *
+   * <p>{@code VenicePushJob.initKIFRepushDetails()} reads this key first, falling back to the deprecated
+   * {@link #KAFKA_INPUT_BROKER_URL} for backward compatibility.
+   *
+   * <p>This key is set in the global Spark/MR job config. At the point of use:
+   * <ul>
+   *   <li>{@code KafkaInputUtils.getConsumerProperties()} resolves this to {@code PUBSUB_BROKER_ADDRESS}
+   *       for PubSub consumer creation.</li>
+   *   <li>{@code SparkPubSubPartitionReaderFactory} and {@code PubSubSplitPlanner} read it directly.</li>
+   *   <li>{@code VeniceKafkaInputReducer} reads this for the source compressor.</li>
+   *   <li>{@code VeniceRmdTTLFilter} and {@code KafkaInputDictTrainer} read it for source topic access.</li>
+   * </ul>
+   *
+   * @see #VENICE_PUSH_DESTINATION_PUBSUB_BROKER the "output/destination" broker for writing new version data
+   */
+  public static final String VENICE_REPUSH_SOURCE_PUBSUB_BROKER = "venice.repush.source.pubsub.broker";
   // Optional
   public static final String KAFKA_INPUT_MAX_RECORDS_PER_MAPPER = "kafka.input.max.records.per.mapper";
 
@@ -352,10 +398,27 @@ public final class VenicePushJobConstants {
   /**
    * Config to control the TTL behaviors in repush.
    */
+  /**
+   * When enabled, KIF repush will use the store's latest value schema ID as a fallback if per-record
+   * schema IDs are not embedded in the source version topic (put.getSchemaId() returns -1). By default
+   * this is disabled and the job will fail if per-record schema IDs are missing, to avoid silently
+   * re-writing records with a potentially incorrect schema.
+   */
+  public static final String REPUSH_USE_FALLBACK_VALUE_SCHEMA_ID = "repush.use.fallback.value.schema.id";
+
   public static final String REPUSH_TTL_ENABLE = "repush.ttl.enable";
   public static final String REPUSH_TTL_POLICY = "repush.ttl.policy";
   public static final String REPUSH_TTL_SECONDS = "repush.ttl.seconds";
   public static final String REPUSH_TTL_START_TIMESTAMP = "repush.ttl.start.timestamp";
+
+  /**
+   * Config to indicate this is a compliance push which could be used for a variety of reasons
+   * by the operator like purging or updating a subset/all the data for compliance purposes.
+   * Compliance pushes can be killed by user-initiated pushes, allowing users to preempt
+   * long-running compliance workflows.
+   */
+  public static final String COMPLIANCE_PUSH = "compliance.push";
+
   public static final String RMD_SCHEMA_DIR = "rmd.schema.dir";
   public static final String VALUE_SCHEMA_DIR = "value.schema.dir";
   public static final int NOT_SET = -1;
@@ -432,6 +495,7 @@ public final class VenicePushJobConstants {
   public static final String DATA_WRITER_COMPUTE_JOB_CLASS = "data.writer.compute.job.class";
 
   public static final String PUSH_TO_SEPARATE_REALTIME_TOPIC = "push.to.separate.realtime.topic";
+
   /**
    * Currently regular batch pushes are not compatible with TTL re-push enabled stores. This is because a regular batch
    * push does not provide any RMD to be used for TTL. You can use the TIMESTAMP_FIELD_PROP to provide record level
@@ -447,4 +511,29 @@ public final class VenicePushJobConstants {
    * propagated to all {@link VenicePushJob} components.
    */
   public static final String NEWER_KME_SCHEMAS_PREFIX = "newer.kme.schemas.prefix.";
+
+  /**
+   * Write quota in records per second for incremental pushes.
+   * Any value {@code <= 0} disables throttling (unlimited writes). The recommended sentinel for
+   * explicitly configuring "unlimited" is {@code -1}.
+   * This quota is enforced per partition-writer task. The effective aggregate write rate across the entire
+   * job is {@code recordsPerSecond * numberOfTasks}.
+   */
+  public static final String INCREMENTAL_PUSH_WRITE_QUOTA_RECORDS_PER_SECOND =
+      "incremental.push.write.quota.records.per.second";
+
+  /**
+   * Time window in milliseconds over which throttling is measured. Defaults to 1 second.
+   * This parameter is only applicable when using TOKEN_BUCKET_INCREMENTAL_REFILL or
+   * TOKEN_BUCKET_GREEDY_REFILL rate limiter types.
+   */
+  public static final String INCREMENTAL_PUSH_WRITE_QUOTA_TIME_WINDOW_MS =
+      "incremental.push.write.quota.time.window.ms";
+
+  /**
+   * Rate limiter implementation for incremental push throttling. Supported values are
+   * defined by {@link com.linkedin.venice.throttle.VeniceRateLimiter.RateLimiterType}.
+   * Defaults to GUAVA_RATE_LIMITER.
+   */
+  public static final String INCREMENTAL_PUSH_RATE_LIMITER_TYPE = "incremental.push.rate.limiter.type";
 }

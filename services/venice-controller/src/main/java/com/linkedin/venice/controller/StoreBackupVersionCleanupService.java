@@ -50,7 +50,8 @@ import org.apache.logging.log4j.Logger;
  * than configured retention time period.
  * If the specified retention time is 0, this service won't delete the backup version right after the latest version is
  * promoted to the new current version since there could be a delay before Routers receive the new version promotion notification.
- * Currently, the minimal retention time is hard-coded as 1 hour here: {@link StoreBackupVersionCleanupService#minBackupVersionCleanupDelay}
+ * Currently, the minimal retention time defaults to 1 hour (configurable via
+ * {@link com.linkedin.venice.ConfigKeys#CONTROLLER_BACKUP_VERSION_MIN_CLEANUP_DELAY_MS})
  * to accommodate the delay between Controller and Router.
  */
 public class StoreBackupVersionCleanupService extends AbstractVeniceService {
@@ -61,9 +62,10 @@ public class StoreBackupVersionCleanupService extends AbstractVeniceService {
 
   /**
    * The minimum delay to clean up backup version, and this is used to make sure all the Routers have enough
-   * time to switch to the new promoted version.
+   * time to switch to the new promoted version. Configurable via
+   * {@link com.linkedin.venice.ConfigKeys#CONTROLLER_BACKUP_VERSION_MIN_CLEANUP_DELAY_MS}.
    */
-  private static long minBackupVersionCleanupDelay = TimeUnit.HOURS.toMillis(1);
+  private final long minBackupVersionCleanupDelay;
 
   private final VeniceHelixAdmin admin;
   private final VeniceControllerMultiClusterConfig multiClusterConfig;
@@ -101,6 +103,7 @@ public class StoreBackupVersionCleanupService extends AbstractVeniceService {
     this.cleanupThread = new Thread(new StoreBackupVersionCleanupTask(), "StoreBackupVersionCleanupTask");
     this.sleepInterval = multiClusterConfig.getBackupVersionCleanupSleepMs();
     this.defaultBackupVersionRetentionMs = multiClusterConfig.getBackupVersionDefaultRetentionMs();
+    this.minBackupVersionCleanupDelay = multiClusterConfig.getBackupVersionMinCleanupDelayMs();
     this.time = time;
     this.metricsRepository = metricsRepository;
     allClusters.forEach(clusterName -> {
@@ -144,10 +147,6 @@ public class StoreBackupVersionCleanupService extends AbstractVeniceService {
     waitTimeDeleteRepushSourceVersion = waitTime;
   }
 
-  public static void setMinBackupVersionCleanupDelay(long delay) {
-    minBackupVersionCleanupDelay = delay;
-  }
-
   CloseableHttpAsyncClient getHttpAsyncClient() {
     return httpAsyncClient;
   }
@@ -156,7 +155,8 @@ public class StoreBackupVersionCleanupService extends AbstractVeniceService {
       Store store,
       long defaultBackupVersionRetentionMs,
       Time time,
-      int currentVersion) {
+      int currentVersion,
+      long minCleanupDelayMs) {
     List<Version> versions = store.getVersions();
 
     // regardless of retention, if there are more than 2 versions, we should clean up
@@ -172,8 +172,8 @@ public class StoreBackupVersionCleanupService extends AbstractVeniceService {
     Version version = store.getVersion(currentVersion);
     if (version != null && version.getRepushSourceVersion() > NON_EXISTING_VERSION) {
       backupVersionRetentionMs = waitTimeDeleteRepushSourceVersion;
-    } else if (backupVersionRetentionMs < minBackupVersionCleanupDelay) {
-      backupVersionRetentionMs = minBackupVersionCleanupDelay;
+    } else if (backupVersionRetentionMs < minCleanupDelayMs) {
+      backupVersionRetentionMs = minCleanupDelayMs;
     }
 
     return store.getLatestVersionPromoteToCurrentTimestamp() + backupVersionRetentionMs < time.getMilliseconds();
@@ -265,7 +265,12 @@ public class StoreBackupVersionCleanupService extends AbstractVeniceService {
       return false;
     }
 
-    if (!whetherStoreReadyToBeCleanup(store, admin.getBackupVersionDefaultRetentionMs(), time, currentVersion)) {
+    if (!whetherStoreReadyToBeCleanup(
+        store,
+        admin.getBackupVersionDefaultRetentionMs(),
+        time,
+        currentVersion,
+        this.minBackupVersionCleanupDelay)) {
       // not ready to clean up backup versions yet, update the backup version ideal state to use 2 replicas after
       // minimal delay
       if (multiClusterConfig.getControllerConfig(clusterName).isBackupVersionReplicaReductionEnabled()) {
@@ -299,39 +304,67 @@ public class StoreBackupVersionCleanupService extends AbstractVeniceService {
       return false;
     }
 
+    long minRetentionThreshold = store.getLatestVersionPromoteToCurrentTimestamp() + minBackupVersionCleanupDelay;
+    long defaultRetentionThreshold =
+        store.getLatestVersionPromoteToCurrentTimestamp() + defaultBackupVersionRetentionMs;
+    boolean pastDefaultRetention = time.getMilliseconds() > defaultRetentionThreshold;
+    boolean pastMinRetention = time.getMilliseconds() > minRetentionThreshold;
+    // We should always wait min retention before any deletion.
+    if (!pastMinRetention) {
+      return false;
+    }
+
     // First, consider any versions that can be deleted (invalid status: error or killed) and are not in use
-    List<Version> readyToBeRemovedVersions = versions.stream()
-        .filter(v -> v.getNumber() < currentVersion && VersionStatus.canDelete(v.getStatus()))
-        .collect(Collectors.toList());
+    List<Version> readyToBeRemovedVersions =
+        versions.stream().filter(v -> VersionStatus.canDelete(v.getStatus())).collect(Collectors.toList());
 
     // This will delete backup versions which satisfy any of the following conditions
     // 1. Current version is from a repush, the version is from the chain of repushes into current version.
     // 2. Current version is from a repush, but still a lingering version older than retention period.
     // 3. Current version is not repush and is older than retention, delete any versions < current version.
     if (readyToBeRemovedVersions.isEmpty()) {
-      long retentionThreshold = store.getLatestVersionPromoteToCurrentTimestamp() + defaultBackupVersionRetentionMs;
       int repushSourceVersion = store.getVersionOrThrow(currentVersion).getRepushSourceVersion();
       boolean isCurrentVersionRepushed = repushSourceVersion > NON_EXISTING_VERSION;
-      boolean pastRetention = time.getMilliseconds() > retentionThreshold;
       HashSet<Integer> repushChainVersions = new HashSet<>(); // all versions repushed into the current version
+
       readyToBeRemovedVersions = versions.stream()
           .sorted((v1, v2) -> Integer.compare(v2.getNumber(), v1.getNumber())) // sort in descending order
           .filter(v -> {
-            if (!isCurrentVersionRepushed) {
+            // always delete past default retention and less than current version
+            if (!isCurrentVersionRepushed || pastDefaultRetention) {
               return v.getNumber() < currentVersion;
             }
-            repushChainVersions.add(v.getRepushSourceVersion()); // descending order, so source can only appear later
-            return v.getNumber() < currentVersion && (repushChainVersions.contains(v.getNumber()) || pastRetention);
+            if (v.getRepushSourceVersion() > NON_EXISTING_VERSION) {
+              repushChainVersions.add(v.getRepushSourceVersion()); // descending order, so source can only appear later
+            }
+            return v.getNumber() < currentVersion && repushChainVersions.contains(v.getNumber());
           })
           .collect(Collectors.toList());
+
+      // If the repush chain filter found nothing but there are old versions below current, the chain
+      // is broken (source versions were already deleted in prior cleanup cycles). Fall back to treating
+      // repush versions below current as deletable to prevent unbounded version accumulation.
+      // Regular-push versions (repushSourceVersion == NON_EXISTING_VERSION) are excluded from this
+      // fallback: they predate the repush chain and must remain governed by default retention.
+      if (isCurrentVersionRepushed && readyToBeRemovedVersions.isEmpty()) {
+        for (Version v: versions) {
+          if (v.getNumber() < currentVersion && v.getRepushSourceVersion() > NON_EXISTING_VERSION) {
+            readyToBeRemovedVersions.add(v);
+          }
+        }
+        readyToBeRemovedVersions.sort((v1, v2) -> Integer.compare(v2.getNumber(), v1.getNumber()));
+      }
 
       if (readyToBeRemovedVersions.isEmpty()) {
         return false;
       }
 
-      // Keep at least 1 backup version until we are past the retention period.
-      if (isCurrentVersionRepushed && readyToBeRemovedVersions.size() >= versions.size() - 1 && !pastRetention) {
-        readyToBeRemovedVersions.remove(0); // choose the newest version
+      if (readyToBeRemovedVersions.size() > 1) {
+        if (isCurrentVersionRepushed) { // keep the oldest
+          readyToBeRemovedVersions.remove(readyToBeRemovedVersions.size() - 1);
+        } else {
+          readyToBeRemovedVersions.remove(0); // keep the newest version
+        }
         if (readyToBeRemovedVersions.isEmpty()) {
           return false;
         }

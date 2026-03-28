@@ -35,6 +35,7 @@ import static com.linkedin.venice.ConfigKeys.CONTROLLER_AUTO_MATERIALIZE_META_SY
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_BACKUP_VERSION_DEFAULT_RETENTION_MS;
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_BACKUP_VERSION_DELETION_SLEEP_MS;
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_BACKUP_VERSION_METADATA_FETCH_BASED_CLEANUP_ENABLED;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_BACKUP_VERSION_MIN_CLEANUP_DELAY_MS;
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_BACKUP_VERSION_REPLICA_REDUCTION_ENABLED;
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_BACKUP_VERSION_RETENTION_BASED_CLEANUP_ENABLED;
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_CLUSTER;
@@ -86,6 +87,15 @@ import static com.linkedin.venice.ConfigKeys.CONTROLLER_PARENT_SYSTEM_STORE_REPA
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_PARENT_SYSTEM_STORE_VERSION_REFRESH_THRESHOLD_IN_DAYS;
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_PROTOCOL_VERSION_AUTO_DETECTION_SERVICE_ENABLED;
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_PROTOCOL_VERSION_AUTO_DETECTION_SLEEP_MS;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_ALL;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_BATCH_USER_STORE_VT;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_EXCLUSION_LIST;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_HYBRID_USER_STORE_RT;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_HYBRID_USER_STORE_VT;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_META_SYSTEM_STORE_RT;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_META_SYSTEM_STORE_VT;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_PUSH_STATUS_SYSTEM_STORE_RT;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_PUSH_STATUS_SYSTEM_STORE_VT;
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_REPUSH_PREFIX;
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_RESOURCE_INSTANCE_GROUP_TAG;
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_SCHEMA_VALIDATION_ENABLED;
@@ -117,6 +127,8 @@ import static com.linkedin.venice.ConfigKeys.DEFAULT_PARTITION_SIZE;
 import static com.linkedin.venice.ConfigKeys.DEFAULT_READ_STRATEGY;
 import static com.linkedin.venice.ConfigKeys.DEFAULT_REPLICA_FACTOR;
 import static com.linkedin.venice.ConfigKeys.DEFAULT_ROUTING_STRATEGY;
+import static com.linkedin.venice.ConfigKeys.DEFAULT_SYSTEM_STORE_VERSION_RETENTION_COUNT;
+import static com.linkedin.venice.ConfigKeys.DEFAULT_USER_STORE_VERSION_RETENTION_COUNT;
 import static com.linkedin.venice.ConfigKeys.DEFERRED_VERSION_SWAP_BUFFER_TIME;
 import static com.linkedin.venice.ConfigKeys.DEFERRED_VERSION_SWAP_FOR_EMPTY_PUSH_ENABLED;
 import static com.linkedin.venice.ConfigKeys.DEFERRED_VERSION_SWAP_REGION_ROLL_FORWARD_ORDER;
@@ -151,6 +163,7 @@ import static com.linkedin.venice.ConfigKeys.KAFKA_MIN_IN_SYNC_REPLICAS_RT_TOPIC
 import static com.linkedin.venice.ConfigKeys.KAFKA_OVER_SSL;
 import static com.linkedin.venice.ConfigKeys.KAFKA_REPLICATION_FACTOR;
 import static com.linkedin.venice.ConfigKeys.KAFKA_REPLICATION_FACTOR_RT_TOPICS;
+import static com.linkedin.venice.ConfigKeys.KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE_RT_TOPICS;
 import static com.linkedin.venice.ConfigKeys.KME_REGISTRATION_FROM_MESSAGE_HEADER_ENABLED;
 import static com.linkedin.venice.ConfigKeys.LEAKED_PUSH_STATUS_CLEAN_UP_SERVICE_SLEEP_INTERVAL_MS;
 import static com.linkedin.venice.ConfigKeys.LEAKED_RESOURCE_ALLOWED_LINGER_TIME_MS;
@@ -179,6 +192,7 @@ import static com.linkedin.venice.ConfigKeys.PARENT_KAFKA_CLUSTER_FABRIC_LIST;
 import static com.linkedin.venice.ConfigKeys.PARTICIPANT_MESSAGE_STORE_ENABLED;
 import static com.linkedin.venice.ConfigKeys.PARTITION_COUNT_ROUND_UP_SIZE;
 import static com.linkedin.venice.ConfigKeys.PERSISTENCE_TYPE;
+import static com.linkedin.venice.ConfigKeys.PUBSUB_PRODUCER_TIMESTAMP_FALLBACK_ENABLED;
 import static com.linkedin.venice.ConfigKeys.PUBSUB_TOPIC_MANAGER_METADATA_FETCHER_CONSUMER_POOL_SIZE;
 import static com.linkedin.venice.ConfigKeys.PUBSUB_TOPIC_MANAGER_METADATA_FETCHER_THREAD_POOL_SIZE;
 import static com.linkedin.venice.ConfigKeys.PUSH_JOB_FAILURE_CHECKPOINTS_TO_DEFINE_USER_ERROR;
@@ -191,6 +205,7 @@ import static com.linkedin.venice.ConfigKeys.REFRESH_ATTEMPTS_FOR_ZK_RECONNECT;
 import static com.linkedin.venice.ConfigKeys.REFRESH_INTERVAL_FOR_ZK_RECONNECT_MS;
 import static com.linkedin.venice.ConfigKeys.REPLICATION_METADATA_VERSION;
 import static com.linkedin.venice.ConfigKeys.REPUSH_CANDIDATE_FILTER_CLASS_NAMES;
+import static com.linkedin.venice.ConfigKeys.REPUSH_CANDIDATE_TRIGGER_CLASS_NAMES;
 import static com.linkedin.venice.ConfigKeys.REPUSH_ORCHESTRATOR_CLASS_NAME;
 import static com.linkedin.venice.ConfigKeys.SERVICE_DISCOVERY_REGISTRATION_RETRY_MS;
 import static com.linkedin.venice.ConfigKeys.SKIP_DEFERRED_VERSION_SWAP_FOR_DVC_ENABLED;
@@ -199,10 +214,12 @@ import static com.linkedin.venice.ConfigKeys.SSL_KAFKA_BOOTSTRAP_SERVERS;
 import static com.linkedin.venice.ConfigKeys.SSL_TO_KAFKA_LEGACY;
 import static com.linkedin.venice.ConfigKeys.STORAGE_ENGINE_OVERHEAD_RATIO;
 import static com.linkedin.venice.ConfigKeys.SYSTEM_SCHEMA_INITIALIZATION_AT_START_TIME_ENABLED;
+import static com.linkedin.venice.ConfigKeys.SYSTEM_STORE_VERSION_RETENTION_COUNT;
 import static com.linkedin.venice.ConfigKeys.TERMINAL_STATE_TOPIC_CHECK_DELAY_MS;
 import static com.linkedin.venice.ConfigKeys.TOPIC_CLEANUP_DELAY_FACTOR;
 import static com.linkedin.venice.ConfigKeys.TOPIC_CLEANUP_SLEEP_INTERVAL_BETWEEN_TOPIC_LIST_FETCH_MS;
 import static com.linkedin.venice.ConfigKeys.UNREGISTER_METRIC_FOR_DELETED_STORE_ENABLED;
+import static com.linkedin.venice.ConfigKeys.USER_STORE_VERSION_RETENTION_COUNT;
 import static com.linkedin.venice.ConfigKeys.USE_DA_VINCI_SPECIFIC_EXECUTION_STATUS_FOR_ERROR;
 import static com.linkedin.venice.ConfigKeys.USE_PUSH_STATUS_STORE_FOR_INCREMENTAL_PUSH;
 import static com.linkedin.venice.ConfigKeys.VENICE_STORAGE_CLUSTER_LEADER_HAAS;
@@ -223,6 +240,7 @@ import com.linkedin.venice.SSLConfig;
 import com.linkedin.venice.acl.VeniceComponent;
 import com.linkedin.venice.authorization.DefaultIdentityParser;
 import com.linkedin.venice.client.store.ClientConfig;
+import com.linkedin.venice.common.VeniceSystemStoreType;
 import com.linkedin.venice.controller.helix.HelixCapacityConfig;
 import com.linkedin.venice.controllerapi.ControllerRoute;
 import com.linkedin.venice.exceptions.ConfigurationException;
@@ -249,6 +267,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -337,6 +356,7 @@ public class VeniceControllerClusterConfig {
   private final long errorPartitionProcessingCycleDelay;
   private final long backupVersionDefaultRetentionMs;
   private final long backupVersionCleanupSleepMs;
+  private final long backupVersionMinCleanupDelayMs;
 
   private final boolean backupVersionRetentionBasedCleanupEnabled;
   private final boolean backupVersionMetadataFetchBasedCleanupEnabled;
@@ -462,6 +482,7 @@ public class VeniceControllerClusterConfig {
   private final boolean systemSchemaInitializationAtStartTimeEnabled;
 
   private final boolean isKMERegistrationFromMessageHeaderEnabled;
+  private final boolean producerTimestampFallbackEnabled;
   private final boolean unusedValueSchemaCleanupServiceEnabled;
 
   private final int unusedSchemaCleanupIntervalSeconds;
@@ -557,6 +578,7 @@ public class VeniceControllerClusterConfig {
   private final Optional<Integer> minInSyncReplicas;
   private final Optional<Integer> minInSyncReplicasRealTimeTopics;
   private final Optional<Integer> minInSyncReplicasAdminTopics;
+  private final Optional<Boolean> uncleanLeaderElectionEnableRealTimeTopics;
   private final boolean kafkaLogCompactionForHybridStores;
 
   /**
@@ -605,7 +627,6 @@ public class VeniceControllerClusterConfig {
 
   private final Set<PushJobCheckpoints> pushJobUserErrorCheckpoints;
   private final boolean isRealTimeTopicVersioningEnabled;
-  private final boolean useV2AdminTopicMetadata;
   private final boolean isHybridStorePartitionCountUpdateEnabled;
 
   /**
@@ -627,6 +648,7 @@ public class VeniceControllerClusterConfig {
    */
   private String repushOrchestratorClassName;
   private Set<String> repushCandidateFilterClassNames;
+  private Set<String> repushCandidateTriggerClassNames;
   private final VeniceProperties repushOrchestratorConfigs;
 
   /**
@@ -676,6 +698,41 @@ public class VeniceControllerClusterConfig {
   private final Set<String> activeActiveRealTimeSourceFabrics;
 
   private final boolean isSkipHybridStoreRTTopicCompactionPolicyUpdateEnabled;
+  /**
+   * Admin operation system store
+   */
+  private final boolean isAdminOperationSystemStoreEnabled;
+
+  private final int userStoreVersionRetentionCount;
+
+  private final int systemStoreVersionRetentionCount;
+
+  // --- Alternative PubSub backend configs ---
+
+  /**
+   * Granular flags controlling which topic types are created on the alternative PubSub backend.
+   * Each value maps 1:1 to a config key and is read into an EnumMap at construction time.
+   * Adding a new topic type requires: (1) a new enum constant here, and (2) a routing case in
+   * {@link #resolveAlternativePubSubBackendTopic}.
+   */
+  enum AlternativePubSubBackendTopic {
+    META_STORE_VT(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_META_SYSTEM_STORE_VT),
+    META_STORE_RT(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_META_SYSTEM_STORE_RT),
+    PUSH_STATUS_STORE_VT(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_PUSH_STATUS_SYSTEM_STORE_VT),
+    PUSH_STATUS_STORE_RT(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_PUSH_STATUS_SYSTEM_STORE_RT),
+    BATCH_USER_STORE_VT(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_BATCH_USER_STORE_VT),
+    HYBRID_USER_STORE_VT(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_HYBRID_USER_STORE_VT),
+    HYBRID_USER_STORE_RT(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_HYBRID_USER_STORE_RT);
+
+    private final String configKey;
+
+    AlternativePubSubBackendTopic(String configKey) {
+      this.configKey = configKey;
+    }
+  }
+
+  private final EnumMap<AlternativePubSubBackendTopic, Boolean> alternativePubSubBackendEnabled;
+  private final Set<String> alternativeBackendExclusionList;
 
   public VeniceControllerClusterConfig(VeniceProperties props) {
     this.props = props;
@@ -687,6 +744,9 @@ public class VeniceControllerClusterConfig {
     this.minInSyncReplicas = props.getOptionalInt(KAFKA_MIN_IN_SYNC_REPLICAS);
     this.minInSyncReplicasRealTimeTopics = props.getOptionalInt(KAFKA_MIN_IN_SYNC_REPLICAS_RT_TOPICS);
     this.minInSyncReplicasAdminTopics = props.getOptionalInt(KAFKA_MIN_IN_SYNC_REPLICAS_ADMIN_TOPICS);
+    this.uncleanLeaderElectionEnableRealTimeTopics = props.containsKey(KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE_RT_TOPICS)
+        ? Optional.of(props.getBoolean(KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE_RT_TOPICS))
+        : Optional.empty();
     this.kafkaLogCompactionForHybridStores = props.getBoolean(KAFKA_LOG_COMPACTION_FOR_HYBRID_STORES, true);
     this.replicationFactor = props.getInt(DEFAULT_REPLICA_FACTOR);
     this.minNumberOfPartitions = props.getInt(DEFAULT_NUMBER_OF_PARTITION);
@@ -1008,6 +1068,8 @@ public class VeniceControllerClusterConfig {
         props.getLong(CONTROLLER_BACKUP_VERSION_DELETION_SLEEP_MS, TimeUnit.MINUTES.toMillis(5));
     this.backupVersionDefaultRetentionMs =
         props.getLong(CONTROLLER_BACKUP_VERSION_DEFAULT_RETENTION_MS, TimeUnit.DAYS.toMillis(7)); // 1 week
+    this.backupVersionMinCleanupDelayMs =
+        props.getLong(CONTROLLER_BACKUP_VERSION_MIN_CLEANUP_DELAY_MS, TimeUnit.HOURS.toMillis(1));
     this.backupVersionRetentionBasedCleanupEnabled =
         props.getBoolean(CONTROLLER_BACKUP_VERSION_RETENTION_BASED_CLEANUP_ENABLED, false);
     this.backupVersionMetadataFetchBasedCleanupEnabled =
@@ -1134,6 +1196,7 @@ public class VeniceControllerClusterConfig {
         props.getBoolean(SYSTEM_SCHEMA_INITIALIZATION_AT_START_TIME_ENABLED, false);
     this.isKMERegistrationFromMessageHeaderEnabled =
         props.getBoolean(KME_REGISTRATION_FROM_MESSAGE_HEADER_ENABLED, false);
+    this.producerTimestampFallbackEnabled = props.getBoolean(PUBSUB_PRODUCER_TIMESTAMP_FALLBACK_ENABLED, true);
     this.enableDisabledReplicaEnabled = props.getBoolean(CONTROLLER_ENABLE_DISABLED_REPLICA_ENABLED, false);
 
     this.unusedValueSchemaCleanupServiceEnabled =
@@ -1163,6 +1226,11 @@ public class VeniceControllerClusterConfig {
         } else {
           this.repushCandidateFilterClassNames = Collections.emptySet();
         }
+        if (props.containsKey(REPUSH_CANDIDATE_TRIGGER_CLASS_NAMES)) {
+          this.repushCandidateTriggerClassNames = new HashSet<>(props.getList(REPUSH_CANDIDATE_TRIGGER_CLASS_NAMES));
+        } else {
+          this.repushCandidateTriggerClassNames = Collections.emptySet();
+        }
       } catch (Exception e) {
         throw new VeniceException(
             "Log compaction enabled but missing controller.repush.orchestrator.class.name config value. Unable to set up log compaction service",
@@ -1188,7 +1256,6 @@ public class VeniceControllerClusterConfig {
     this.isRealTimeTopicVersioningEnabled = props.getBoolean(
         ConfigKeys.CONTROLLER_ENABLE_REAL_TIME_TOPIC_VERSIONING,
         DEFAULT_CONTROLLER_ENABLE_REAL_TIME_TOPIC_VERSIONING);
-    this.useV2AdminTopicMetadata = props.getBoolean(ConfigKeys.USE_V2_ADMIN_TOPIC_METADATA, false);
     this.isHybridStorePartitionCountUpdateEnabled =
         props.getBoolean(ConfigKeys.CONTROLLER_ENABLE_HYBRID_STORE_PARTITION_COUNT_UPDATE, false);
 
@@ -1276,6 +1343,25 @@ public class VeniceControllerClusterConfig {
         props.getBoolean(CONTROLLER_BACKUP_VERSION_REPLICA_REDUCTION_ENABLED, false);
     this.useMultiRegionRealTimeTopicSwitcher =
         props.getBoolean(ConfigKeys.CONTROLLER_USE_MULTI_REGION_REAL_TIME_TOPIC_SWITCHER_ENABLED, false);
+    this.isAdminOperationSystemStoreEnabled =
+        props.getBoolean(ConfigKeys.CONTROLLER_ADMIN_OPERATION_SYSTEM_STORE_ENABLED, false);
+
+    this.userStoreVersionRetentionCount =
+        props.getInt(USER_STORE_VERSION_RETENTION_COUNT, DEFAULT_USER_STORE_VERSION_RETENTION_COUNT);
+    this.systemStoreVersionRetentionCount =
+        props.getInt(SYSTEM_STORE_VERSION_RETENTION_COUNT, DEFAULT_SYSTEM_STORE_VERSION_RETENTION_COUNT);
+
+    // Alternative PubSub backend configs
+    boolean enableAll = props.getBoolean(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_ALL, false);
+    EnumMap<AlternativePubSubBackendTopic, Boolean> flags = new EnumMap<>(AlternativePubSubBackendTopic.class);
+    for (AlternativePubSubBackendTopic topic: AlternativePubSubBackendTopic.values()) {
+      flags.put(topic, props.getBoolean(topic.configKey, enableAll));
+    }
+    this.alternativePubSubBackendEnabled = flags;
+    String exclusionListStr = props.getString(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_EXCLUSION_LIST, "");
+    this.alternativeBackendExclusionList = exclusionListStr.isEmpty()
+        ? Collections.emptySet()
+        : Collections.unmodifiableSet(new HashSet<>(Arrays.asList(exclusionListStr.split("\\s*,\\s*"))));
 
     this.logClusterConfig();
   }
@@ -1288,6 +1374,7 @@ public class VeniceControllerClusterConfig {
     // Repush
     LOGGER.info("\trepushOrchestratorClassName: {}", repushOrchestratorClassName);
     LOGGER.info("\trepushCandidateFilterClassNames: {}", repushCandidateFilterClassNames);
+    LOGGER.info("\trepushCandidateTriggerClassNames: {}", repushCandidateTriggerClassNames);
 
     // Log compaction
     LOGGER.info("\tisLogCompactionEnabled: {}", isLogCompactionEnabled);
@@ -1296,6 +1383,49 @@ public class VeniceControllerClusterConfig {
     LOGGER.info("\tlogCompactionIntervalMS: {}", logCompactionIntervalMS);
     LOGGER.info("\tlogCompactionVersionStalenessThresholdMS: {}", logCompactionVersionStalenessThresholdMS);
     LOGGER.info("\tlogCompactionDuplicateKeyThreshold: {}", logCompactionDuplicateKeyThreshold);
+  }
+
+  /**
+   * Whether to use alternative pubsub backend for this store/topic combination.
+   * Checks the exact store name against the exclusion list, then resolves the appropriate
+   * {@link AlternativePubSubBackendTopic} flag via {@link #resolveAlternativePubSubBackendTopic}.
+   * Excluding a user store does not affect its system stores; each must be excluded independently.
+   *
+   * <p>For user store VTs, {@code isHybridStore} selects between {@link AlternativePubSubBackendTopic#BATCH_USER_STORE_VT}
+   * and {@link AlternativePubSubBackendTopic#HYBRID_USER_STORE_VT}. It is ignored for RT topics and system stores.
+   */
+  public boolean shouldUseAlternativePubSubBackend(String storeName, boolean isRealTime, boolean isHybridStore) {
+    if (alternativeBackendExclusionList.contains(storeName)) {
+      return false;
+    }
+    return alternativePubSubBackendEnabled
+        .get(resolveAlternativePubSubBackendTopic(storeName, isRealTime, isHybridStore));
+  }
+
+  private AlternativePubSubBackendTopic resolveAlternativePubSubBackendTopic(
+      String storeName,
+      boolean isRealTime,
+      boolean isHybridStore) {
+    VeniceSystemStoreType systemStoreType = VeniceSystemStoreType.getSystemStoreType(storeName);
+    if (systemStoreType == VeniceSystemStoreType.META_STORE) {
+      return isRealTime ? AlternativePubSubBackendTopic.META_STORE_RT : AlternativePubSubBackendTopic.META_STORE_VT;
+    } else if (systemStoreType == VeniceSystemStoreType.DAVINCI_PUSH_STATUS_STORE) {
+      return isRealTime
+          ? AlternativePubSubBackendTopic.PUSH_STATUS_STORE_RT
+          : AlternativePubSubBackendTopic.PUSH_STATUS_STORE_VT;
+    }
+    if (isRealTime) {
+      return AlternativePubSubBackendTopic.HYBRID_USER_STORE_RT;
+    }
+    return isHybridStore
+        ? AlternativePubSubBackendTopic.HYBRID_USER_STORE_VT
+        : AlternativePubSubBackendTopic.BATCH_USER_STORE_VT;
+  }
+
+  /** @deprecated use {@link #shouldUseAlternativePubSubBackend(String, boolean, boolean)} */
+  @Deprecated
+  public boolean shouldUseAlternativePubSubBackend(String storeName, boolean isRealTime) {
+    return shouldUseAlternativePubSubBackend(storeName, isRealTime, false);
   }
 
   public VeniceProperties getProps() {
@@ -1482,6 +1612,10 @@ public class VeniceControllerClusterConfig {
 
   public Optional<Integer> getMinInSyncReplicasAdminTopics() {
     return minInSyncReplicasAdminTopics;
+  }
+
+  public Optional<Boolean> getUncleanLeaderElectionEnableRealTimeTopics() {
+    return uncleanLeaderElectionEnableRealTimeTopics;
   }
 
   public boolean isKafkaLogCompactionForHybridStoresEnabled() {
@@ -1802,6 +1936,10 @@ public class VeniceControllerClusterConfig {
     return backupVersionCleanupSleepMs;
   }
 
+  public long getBackupVersionMinCleanupDelayMs() {
+    return backupVersionMinCleanupDelayMs;
+  }
+
   public boolean isBackupVersionRetentionBasedCleanupEnabled() {
     return backupVersionRetentionBasedCleanupEnabled;
   }
@@ -2072,6 +2210,10 @@ public class VeniceControllerClusterConfig {
     return isKMERegistrationFromMessageHeaderEnabled;
   }
 
+  public boolean isProducerTimestampFallbackEnabled() {
+    return producerTimestampFallbackEnabled;
+  }
+
   public PubSubClientsFactory getPubSubClientsFactory() {
     return pubSubClientsFactory;
   }
@@ -2228,10 +2370,6 @@ public class VeniceControllerClusterConfig {
     return isDarkCluster;
   }
 
-  public boolean useV2AdminTopicMetadata() {
-    return useV2AdminTopicMetadata;
-  }
-
   public boolean isProtocolVersionAutoDetectionServiceEnabled() {
     return isProtocolVersionAutoDetectionServiceEnabled;
   }
@@ -2246,6 +2384,10 @@ public class VeniceControllerClusterConfig {
 
   public boolean isSkipHybridStoreRTTopicCompactionPolicyUpdateEnabled() {
     return isSkipHybridStoreRTTopicCompactionPolicyUpdateEnabled;
+  }
+
+  public boolean isAdminOperationSystemStoreEnabled() {
+    return isAdminOperationSystemStoreEnabled;
   }
 
   /**
@@ -2283,6 +2425,10 @@ public class VeniceControllerClusterConfig {
 
   public Set<String> getRepushCandidateFilterClassNames() {
     return repushCandidateFilterClassNames;
+  }
+
+  public Set<String> getRepushCandidateTriggerClassNames() {
+    return repushCandidateTriggerClassNames;
   }
 
   public VeniceProperties getRepushOrchestratorConfigs() {
@@ -2415,7 +2561,16 @@ public class VeniceControllerClusterConfig {
     }
   }
 
+  public int getUserStoreVersionRetentionCount() {
+    return userStoreVersionRetentionCount;
+  }
+
+  public int getSystemStoreVersionRetentionCount() {
+    return systemStoreVersionRetentionCount;
+  }
+
   public LogContext getLogContext() {
     return logContext;
   }
+
 }

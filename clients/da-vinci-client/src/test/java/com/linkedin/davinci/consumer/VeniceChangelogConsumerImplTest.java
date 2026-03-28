@@ -16,6 +16,7 @@ import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doCallRealMethod;
+import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -36,9 +37,8 @@ import com.linkedin.davinci.kafka.consumer.TestPubSubTopic;
 import com.linkedin.davinci.repository.NativeMetadataRepositoryViewAdapter;
 import com.linkedin.davinci.store.record.ByteBufferValueRecord;
 import com.linkedin.davinci.utils.ChunkAssembler;
-import com.linkedin.venice.client.change.capture.protocol.RecordChangeEvent;
-import com.linkedin.venice.client.change.capture.protocol.ValueBytes;
 import com.linkedin.venice.compression.CompressionStrategy;
+import com.linkedin.venice.compression.GzipCompressor;
 import com.linkedin.venice.compression.VeniceCompressor;
 import com.linkedin.venice.controllerapi.D2ControllerClient;
 import com.linkedin.venice.controllerapi.MultiSchemaResponse;
@@ -49,7 +49,6 @@ import com.linkedin.venice.kafka.protocol.EndOfPush;
 import com.linkedin.venice.kafka.protocol.KafkaMessageEnvelope;
 import com.linkedin.venice.kafka.protocol.ProducerMetadata;
 import com.linkedin.venice.kafka.protocol.Put;
-import com.linkedin.venice.kafka.protocol.StartOfPush;
 import com.linkedin.venice.kafka.protocol.VersionSwap;
 import com.linkedin.venice.kafka.protocol.enums.ControlMessageType;
 import com.linkedin.venice.kafka.protocol.enums.MessageType;
@@ -86,7 +85,7 @@ import com.linkedin.venice.utils.TestUtils;
 import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import com.linkedin.venice.utils.lazy.Lazy;
-import com.linkedin.venice.views.ChangeCaptureView;
+import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -109,7 +108,6 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.apache.avro.Schema;
@@ -185,6 +183,7 @@ public class VeniceChangelogConsumerImplTest {
     when(mockRepository.getValueSchema(storeName, 1)).thenReturn(new SchemaEntry(1, valueSchema));
     when(store.getVersionOrThrow(Mockito.anyInt())).thenReturn(mockVersion);
     when(store.getVersion(Mockito.anyInt())).thenReturn(mockVersion);
+    when(store.isEnableReads()).thenReturn(true);
 
     mockPubSubConsumer = mock(PubSubConsumerAdapter.class);
     oldVersionTopic = pubSubTopicRepository.getTopic(Version.composeKafkaTopic(storeName, 1));
@@ -213,71 +212,6 @@ public class VeniceChangelogConsumerImplTest {
   }
 
   @Test
-  public void testConsumeBeforeAndAfterImage() throws ExecutionException, InterruptedException {
-    doReturn(new HashSet<>()).when(mockPubSubConsumer).getAssignment();
-    PubSubTopic newVersionTopic = pubSubTopicRepository.getTopic(Version.composeKafkaTopic(storeName, 2));
-    PubSubTopic oldVersionTopic = pubSubTopicRepository.getTopic(Version.composeKafkaTopic(storeName, 1));
-    PubSubTopic newChangeCaptureTopic =
-        pubSubTopicRepository.getTopic(newVersionTopic.getName() + ChangeCaptureView.CHANGE_CAPTURE_TOPIC_SUFFIX);
-    PubSubTopic oldChangeCaptureTopic =
-        pubSubTopicRepository.getTopic(oldVersionTopic.getName() + ChangeCaptureView.CHANGE_CAPTURE_TOPIC_SUFFIX);
-
-    int partition = 0;
-    prepareChangeCaptureRecordsToBePolled(
-        0L,
-        5L,
-        mockPubSubConsumer,
-        oldChangeCaptureTopic,
-        partition,
-        oldVersionTopic,
-        newVersionTopic,
-        false,
-        false);
-    ChangelogClientConfig changelogClientConfig =
-        getChangelogClientConfig().setViewName("changeCaptureView").setIsBeforeImageView(true);
-    VeniceChangelogConsumerImpl<String, Utf8> veniceChangelogConsumer = new VeniceChangelogConsumerImpl<>(
-        changelogClientConfig,
-        mockPubSubConsumer,
-        PubSubMessageDeserializer.createDefaultDeserializer(),
-        veniceChangelogConsumerClientFactory);
-
-    veniceChangelogConsumer.setStoreRepository(mockRepository);
-
-    Assert.assertEquals(veniceChangelogConsumer.getPartitionCount(), 2);
-
-    veniceChangelogConsumer.subscribe(new HashSet<>(Arrays.asList(0))).get();
-    veniceChangelogConsumer.seekToTimestamp(System.currentTimeMillis() - 10000L);
-    PubSubTopicPartition oldVersionTopicPartition = new PubSubTopicPartitionImpl(oldVersionTopic, 0);
-    verify(mockPubSubConsumer).subscribe(oldVersionTopicPartition, PubSubSymbolicPosition.EARLIEST);
-
-    veniceChangelogConsumer.subscribe(new HashSet<>(Arrays.asList(0))).get();
-
-    List<PubSubMessage<String, ChangeEvent<Utf8>, VeniceChangeCoordinate>> pubSubMessages =
-        (List<PubSubMessage<String, ChangeEvent<Utf8>, VeniceChangeCoordinate>>) veniceChangelogConsumer
-            .poll(pollTimeoutMs);
-    for (int i = 0; i < 5; i++) {
-      PubSubMessage<String, ChangeEvent<Utf8>, VeniceChangeCoordinate> pubSubMessage = pubSubMessages.get(i);
-      ChangeEvent<Utf8> changeEvent = pubSubMessage.getValue();
-      Assert.assertEquals(changeEvent.getCurrentValue().toString(), "newValue" + i);
-      Assert.assertEquals(changeEvent.getPreviousValue().toString(), "oldValue" + i);
-    }
-    // Verify version swap happened.
-
-    PubSubTopicPartition pubSubTopicPartition = new PubSubTopicPartitionImpl(newChangeCaptureTopic, 0);
-    verify(mockPubSubConsumer).subscribe(pubSubTopicPartition, PubSubSymbolicPosition.EARLIEST);
-    pubSubMessages = (List<PubSubMessage<String, ChangeEvent<Utf8>, VeniceChangeCoordinate>>) veniceChangelogConsumer
-        .poll(pollTimeoutMs);
-    Assert.assertTrue(pubSubMessages.isEmpty());
-
-    doReturn(Collections.singleton(pubSubTopicPartition)).when(mockPubSubConsumer).getAssignment();
-    veniceChangelogConsumer.pause(Collections.singleton(0));
-    verify(mockPubSubConsumer).pause(any());
-
-    veniceChangelogConsumer.resume(Collections.singleton(0));
-    verify(mockPubSubConsumer).resume(any());
-  }
-
-  @Test
   public void testAfterImageConsumerSeek() throws ExecutionException, InterruptedException {
     MultiSchemaResponse multiRMDSchemaResponse = mock(MultiSchemaResponse.class);
     MultiSchemaResponse.Schema rmdSchemaFromMultiSchemaResponse = mock(MultiSchemaResponse.Schema.class);
@@ -290,16 +224,24 @@ public class VeniceChangelogConsumerImplTest {
 
     PubSubConsumerAdapter mockInternalSeekConsumer = Mockito.mock(PubSubConsumerAdapter.class);
 
-    prepareChangeCaptureRecordsToBePolled(
-        0L,
-        10L,
-        mockInternalSeekConsumer,
-        oldVersionTopic,
-        0,
-        oldVersionTopic,
-        null,
-        true,
-        false);
+    // Build records with EOP for the internal seek consumer. internalSeekToEndOfPush polls with
+    // a 5000ms timeout, so we must use anyLong() instead of the default pollTimeoutMs matcher.
+    List<DefaultPubSubMessage> seekRecords = new ArrayList<>();
+    for (long i = 0L; i < 10L; i++) {
+      seekRecords.add(
+          constructConsumerRecord(
+              oldVersionTopic,
+              0,
+              "newValue" + i,
+              "key" + i,
+              Arrays.asList(i, i),
+              mockPubSubPosition));
+    }
+    seekRecords.add(constructEndOfPushMessage(oldVersionTopic, 0, 11L));
+    Map<PubSubTopicPartition, List<DefaultPubSubMessage>> seekRecordsMap = new HashMap<>();
+    seekRecordsMap.put(new PubSubTopicPartitionImpl(oldVersionTopic, 0), seekRecords);
+    doReturn(seekRecordsMap).when(mockInternalSeekConsumer).poll(Mockito.anyLong());
+
     VeniceAfterImageConsumerImpl<String, Utf8> veniceChangelogConsumer = new VeniceAfterImageConsumerImpl<>(
         changelogClientConfig,
         mockPubSubConsumer,
@@ -315,6 +257,7 @@ public class VeniceChangelogConsumerImplTest {
     when(store.getPartitionCount()).thenReturn(2);
     when(mockRepository.getStore(anyString())).thenReturn(store);
     when(store.getVersion(Mockito.anyInt())).thenReturn(mockVersion);
+    when(store.isEnableReads()).thenReturn(true);
     veniceChangelogConsumer.setStoreRepository(mockRepository);
 
     Assert.assertEquals(veniceChangelogConsumer.getPartitionCount(), 2);
@@ -632,7 +575,7 @@ public class VeniceChangelogConsumerImplTest {
     BasicConsumerStats mockChangeCaptureStats = mock(BasicConsumerStats.class);
 
     VersionSwapDataChangeListener changeListener =
-        new VersionSwapDataChangeListener(mockConsumer, mockRepository, storeName, "", mockChangeCaptureStats);
+        new VersionSwapDataChangeListener(mockConsumer, mockRepository, storeName, "", mockChangeCaptureStats, false);
     changeListener.handleStoreChanged(mockStore);
     verify(mockConsumer).internalSeekToEndOfPush(anySet(), any(), anyBoolean());
     verify(mockChangeCaptureStats).emitVersionSwapCountMetrics(SUCCESS);
@@ -674,7 +617,8 @@ public class VeniceChangelogConsumerImplTest {
         mockRepository,
         storeName,
         "",
-        mockChangeCaptureStats);
+        mockChangeCaptureStats,
+        false);
     changeListener.handleStoreChanged(mockStore);
     verify(veniceChangelogConsumer).handleVersionSwapFailure(any());
 
@@ -682,101 +626,6 @@ public class VeniceChangelogConsumerImplTest {
 
     verify(veniceChangelogConsumer, times(3)).internalSeekToEndOfPush(anySet(), any(), anyBoolean());
     verify(mockChangeCaptureStats).emitVersionSwapCountMetrics(FAIL);
-  }
-
-  @Test
-  public void testHandleVersionSwapControlMessage() throws NoSuchFieldException, IllegalAccessException {
-    VeniceChangelogConsumerImpl veniceChangelogConsumer = mock(VeniceChangelogConsumerImpl.class);
-
-    Map<Integer, Map<Integer, List<Long>>> currentVersionHighWatermarks = new VeniceConcurrentHashMap<>();
-    Field currentVersionHighWatermarksField =
-        VeniceChangelogConsumerImpl.class.getDeclaredField("currentVersionHighWatermarks");
-    currentVersionHighWatermarksField.setAccessible(true);
-    currentVersionHighWatermarksField.set(veniceChangelogConsumer, currentVersionHighWatermarks);
-
-    ChunkAssembler chunkAssembler = mock(ChunkAssembler.class);
-    Field chunkAssemblerField = VeniceChangelogConsumerImpl.class.getDeclaredField("chunkAssembler");
-    chunkAssemblerField.setAccessible(true);
-    chunkAssemblerField.set(veniceChangelogConsumer, chunkAssembler);
-
-    BasicConsumerStats consumerStats = mock(BasicConsumerStats.class);
-    Field changeCaptureStatsField = VeniceChangelogConsumerImpl.class.getDeclaredField("changeCaptureStats");
-    changeCaptureStatsField.setAccessible(true);
-    changeCaptureStatsField.set(veniceChangelogConsumer, consumerStats);
-
-    PubSubTopicRepository pubSubTopicRepository = mock(PubSubTopicRepository.class);
-    PubSubTopic pubSubTopic = mock(PubSubTopic.class);
-    // Throw an exception the first two times to trigger retries
-    when(pubSubTopicRepository.getTopic(anyString())).thenThrow(new RuntimeException("First attempt failed"))
-        .thenThrow(new RuntimeException("Second attempt failed"))
-        .thenReturn(pubSubTopic);
-
-    Field pubSubTopicRepositoryField = VeniceChangelogConsumerImpl.class.getDeclaredField("pubSubTopicRepository");
-    pubSubTopicRepositoryField.setAccessible(true);
-    pubSubTopicRepositoryField.set(veniceChangelogConsumer, pubSubTopicRepository);
-
-    ControlMessage controlMessage = new ControlMessage();
-    controlMessage.controlMessageType = ControlMessageType.VERSION_SWAP.getValue();
-    controlMessage.controlMessageUnion = ControlMessageType.VERSION_SWAP.getNewInstance();
-    VersionSwap versionSwapMessage = new VersionSwap();
-    versionSwapMessage.oldServingVersionTopic = "topic_v1";
-    versionSwapMessage.newServingVersionTopic = "topic_v2";
-    versionSwapMessage.localHighWatermarks = Arrays.asList(1L, 2L, 3L);
-    controlMessage.controlMessageUnion = versionSwapMessage;
-
-    PubSubTopicPartition pubSubTopicPartition = mock(PubSubTopicPartition.class);
-    String topicSuffix = "suffix";
-    Integer partition = 1;
-    when(pubSubTopicPartition.getTopicName()).thenReturn((String) versionSwapMessage.newServingVersionTopic);
-    when(pubSubTopicPartition.getPartitionNumber()).thenReturn(partition);
-
-    doCallRealMethod().when(veniceChangelogConsumer)
-        .handleVersionSwapControlMessage(controlMessage, pubSubTopicPartition, topicSuffix, partition);
-    assertTrue(
-        veniceChangelogConsumer
-            .handleVersionSwapControlMessage(controlMessage, pubSubTopicPartition, topicSuffix, partition));
-    verify(veniceChangelogConsumer).switchToNewTopic(pubSubTopic, topicSuffix, partition);
-    verify(consumerStats).emitVersionSwapCountMetrics(SUCCESS);
-  }
-
-  @Test
-  public void testHandleVersionSwapControlMessageFail() throws NoSuchFieldException, IllegalAccessException {
-    VeniceChangelogConsumerImpl veniceChangelogConsumer = mock(VeniceChangelogConsumerImpl.class);
-
-    BasicConsumerStats consumerStats = mock(BasicConsumerStats.class);
-    Field changeCaptureStatsField = VeniceChangelogConsumerImpl.class.getDeclaredField("changeCaptureStats");
-    changeCaptureStatsField.setAccessible(true);
-    changeCaptureStatsField.set(veniceChangelogConsumer, consumerStats);
-
-    PubSubTopicRepository pubSubTopicRepository = mock(PubSubTopicRepository.class);
-    PubSubTopic pubSubTopic = mock(PubSubTopic.class);
-    when(pubSubTopicRepository.getTopic(anyString())).thenReturn(pubSubTopic);
-
-    Field pubSubTopicRepositoryField = VeniceChangelogConsumerImpl.class.getDeclaredField("pubSubTopicRepository");
-    pubSubTopicRepositoryField.setAccessible(true);
-    pubSubTopicRepositoryField.set(veniceChangelogConsumer, pubSubTopicRepository);
-
-    ControlMessage controlMessage = new ControlMessage();
-    controlMessage.controlMessageType = ControlMessageType.VERSION_SWAP.getValue();
-    controlMessage.controlMessageUnion = ControlMessageType.VERSION_SWAP.getNewInstance();
-    VersionSwap versionSwapMessage = new VersionSwap();
-    versionSwapMessage.oldServingVersionTopic = "topic_v1";
-    versionSwapMessage.newServingVersionTopic = "topic_v2";
-    versionSwapMessage.localHighWatermarks = Arrays.asList(1L, 2L, 3L);
-    controlMessage.controlMessageUnion = versionSwapMessage;
-
-    PubSubTopicPartition pubSubTopicPartition = mock(PubSubTopicPartition.class);
-    String topicSuffix = "suffix";
-    Integer partition = 1;
-    when(pubSubTopicPartition.getPartitionNumber()).thenReturn(partition);
-
-    doCallRealMethod().when(veniceChangelogConsumer)
-        .handleVersionSwapControlMessage(controlMessage, pubSubTopicPartition, topicSuffix, partition);
-    assertThrows(
-        Exception.class,
-        () -> veniceChangelogConsumer
-            .handleVersionSwapControlMessage(controlMessage, pubSubTopicPartition, topicSuffix, partition));
-    verify(consumerStats).emitVersionSwapCountMetrics(VeniceResponseStatusCategory.FAIL);
   }
 
   @Test
@@ -854,18 +703,6 @@ public class VeniceChangelogConsumerImplTest {
     keyDeserializerField.setAccessible(true);
     keyDeserializerField.set(veniceChangelogConsumer, keyDeserializer);
 
-    Map<Integer, AtomicLong> partitionToPutMessageCount = new VeniceConcurrentHashMap<>();
-    Field partitionToPutMessageCountField =
-        VeniceChangelogConsumerImpl.class.getDeclaredField("partitionToPutMessageCount");
-    partitionToPutMessageCountField.setAccessible(true);
-    partitionToPutMessageCountField.set(veniceChangelogConsumer, partitionToPutMessageCount);
-
-    Map<Integer, Map<Integer, List<Long>>> currentVersionHighWatermarks = new VeniceConcurrentHashMap<>();
-    Field currentVersionHighWatermarksField =
-        VeniceChangelogConsumerImpl.class.getDeclaredField("currentVersionHighWatermarks");
-    currentVersionHighWatermarksField.setAccessible(true);
-    currentVersionHighWatermarksField.set(veniceChangelogConsumer, currentVersionHighWatermarks);
-
     int partition = 0;
     PubSubTopic pubSubTopic = pubSubTopicRepository.getTopic(Version.composeKafkaTopic(storeName, 2));
     PubSubTopicPartition topicPartition = new PubSubTopicPartitionImpl(pubSubTopic, partition);
@@ -901,18 +738,15 @@ public class VeniceChangelogConsumerImplTest {
     messagesMap.put(topicPartition, messages);
     when(pubSubConsumer.poll(pollTimeoutMs)).thenReturn(messagesMap);
 
-    doCallRealMethod().when(veniceChangelogConsumer)
-        .convertPubSubMessageToPubSubChangeEventMessage(pubSubMessage1, topicPartition);
-    doCallRealMethod().when(veniceChangelogConsumer)
-        .convertPubSubMessageToPubSubChangeEventMessage(pubSubMessage2, topicPartition);
+    doCallRealMethod().when(veniceChangelogConsumer).convertPubSubMessageToChangeEvent(pubSubMessage1, topicPartition);
+    doCallRealMethod().when(veniceChangelogConsumer).convertPubSubMessageToChangeEvent(pubSubMessage2, topicPartition);
 
     PubSubPosition p0 = ApacheKafkaOffsetPosition.of(0L);
     when(chunkAssembler.bufferAndAssembleRecord(topicPartition, put2.schemaId, null, put2.putValue, p0, compressor))
         .thenReturn(mock(ByteBufferValueRecord.class));
 
-    doCallRealMethod().when(veniceChangelogConsumer)
-        .internalPoll(pollTimeoutMs, ChangeCaptureView.CHANGE_CAPTURE_TOPIC_SUFFIX, false);
-    veniceChangelogConsumer.internalPoll(pollTimeoutMs, ChangeCaptureView.CHANGE_CAPTURE_TOPIC_SUFFIX, false);
+    doCallRealMethod().when(veniceChangelogConsumer).internalPoll(pollTimeoutMs, false);
+    veniceChangelogConsumer.internalPoll(pollTimeoutMs, false);
 
     verify(consumerStats, times(2)).emitChunkedRecordCountMetrics(SUCCESS);
     verify(consumerStats).emitPollCountMetrics(SUCCESS);
@@ -920,8 +754,74 @@ public class VeniceChangelogConsumerImplTest {
   }
 
   @Test
+  public void testChunkedRecordWithRealGzipCompressorEndToEnd()
+      throws IOException, NoSuchFieldException, IllegalAccessException {
+    VeniceChangelogConsumerImpl veniceChangelogConsumer = mock(VeniceChangelogConsumerImpl.class);
+
+    GzipCompressor realCompressor = new GzipCompressor();
+    when(veniceChangelogConsumer.getVersionCompressor(any(PubSubTopic.class))).thenReturn(realCompressor);
+
+    ChunkAssembler chunkAssembler = mock(ChunkAssembler.class);
+    setField(veniceChangelogConsumer, "chunkAssembler", chunkAssembler);
+
+    StoreDeserializerCache storeDeserializerCache = mock(StoreDeserializerCache.class);
+    setField(veniceChangelogConsumer, "storeDeserializerCache", storeDeserializerCache);
+    RecordDeserializer valueDeserializer = mock(RecordDeserializer.class);
+    when(storeDeserializerCache.getDeserializer(anyInt(), anyInt())).thenReturn(valueDeserializer);
+
+    RecordDeserializer keyDeserializer = mock(RecordDeserializer.class);
+    setField(veniceChangelogConsumer, "keyDeserializer", keyDeserializer);
+
+    int partition = 0;
+    PubSubTopic pubSubTopic = pubSubTopicRepository.getTopic(Version.composeKafkaTopic(storeName, 2));
+    PubSubTopicPartition topicPartition = new PubSubTopicPartitionImpl(pubSubTopic, partition);
+
+    // Build a chunk manifest PUT message with non-GZIP manifest bytes
+    Put put = new Put();
+    put.schemaId = AvroProtocolDefinition.CHUNKED_VALUE_MANIFEST.getCurrentProtocolVersion();
+    put.putValue = ByteBuffer.wrap(new byte[] { 0x01, 0x02, 0x03, 0x04 });
+
+    DefaultPubSubMessage message = mock(DefaultPubSubMessage.class);
+    when(message.getPosition()).thenReturn(mockPubSubPosition);
+    when(message.getPartition()).thenReturn(partition);
+    KafkaKey mockKey = mock(KafkaKey.class);
+    when(mockKey.getKey()).thenReturn(Integer.toString(1).getBytes());
+    when(message.getKey()).thenReturn(mockKey);
+    KafkaMessageEnvelope envelope = mock(KafkaMessageEnvelope.class);
+    envelope.payloadUnion = put;
+    when(message.getValue()).thenReturn(envelope);
+
+    // ChunkAssembler returns an already-decompressed record (as RawBytesChunkingAdapter would)
+    byte[] decompressedValue = "this-is-already-decompressed-data".getBytes();
+    ByteBufferValueRecord<ByteBuffer> assembledRecord =
+        new ByteBufferValueRecord<>(ByteBuffer.wrap(decompressedValue), 1);
+    when(chunkAssembler.bufferAndAssembleRecord(eq(topicPartition), eq(put.schemaId), any(), any(), any(), any()))
+        .thenReturn(assembledRecord);
+
+    doCallRealMethod().when(veniceChangelogConsumer).convertPubSubMessageToChangeEvent(message, topicPartition);
+
+    // Before the fix, this threw VeniceException wrapping "ZipException: Not in GZIP format"
+    veniceChangelogConsumer.convertPubSubMessageToChangeEvent(message, topicPartition);
+
+    // Verify the deserializer received the already-decompressed value directly
+    ArgumentCaptor<ByteBuffer> captor = ArgumentCaptor.forClass(ByteBuffer.class);
+    verify(valueDeserializer).deserialize(captor.capture());
+    byte[] capturedBytes = new byte[captor.getValue().remaining()];
+    captor.getValue().get(capturedBytes);
+    assertEquals(capturedBytes, decompressedValue);
+  }
+
+  private static void setField(Object target, String fieldName, Object value)
+      throws NoSuchFieldException, IllegalAccessException {
+    Field field = VeniceChangelogConsumerImpl.class.getDeclaredField(fieldName);
+    field.setAccessible(true);
+    field.set(target, value);
+  }
+
+  @Test
   public void testChunkingFailure() throws NoSuchFieldException, IllegalAccessException {
     VeniceChangelogConsumerImpl veniceChangelogConsumer = mock(VeniceChangelogConsumerImpl.class);
+    doNothing().when(veniceChangelogConsumer).throwIfReadsDisabled();
 
     Field changelogClientConfigField = VeniceChangelogConsumerImpl.class.getDeclaredField("changelogClientConfig");
     changelogClientConfigField.setAccessible(true);
@@ -965,15 +865,10 @@ public class VeniceChangelogConsumerImplTest {
     messagesMap.put(topicPartition, messages);
     when(pubSubConsumer.poll(pollTimeoutMs)).thenReturn(messagesMap);
 
-    doCallRealMethod().when(veniceChangelogConsumer)
-        .convertPubSubMessageToPubSubChangeEventMessage(pubSubMessage, topicPartition);
+    doCallRealMethod().when(veniceChangelogConsumer).convertPubSubMessageToChangeEvent(pubSubMessage, topicPartition);
 
-    doCallRealMethod().when(veniceChangelogConsumer)
-        .internalPoll(pollTimeoutMs, ChangeCaptureView.CHANGE_CAPTURE_TOPIC_SUFFIX, false);
-    assertThrows(
-        Exception.class,
-        () -> veniceChangelogConsumer
-            .internalPoll(pollTimeoutMs, ChangeCaptureView.CHANGE_CAPTURE_TOPIC_SUFFIX, false));
+    doCallRealMethod().when(veniceChangelogConsumer).internalPoll(pollTimeoutMs, false);
+    assertThrows(Exception.class, () -> veniceChangelogConsumer.internalPoll(pollTimeoutMs, false));
 
     verify(consumerStats).emitChunkedRecordCountMetrics(FAIL);
     verify(consumerStats).emitPollCountMetrics(FAIL);
@@ -995,7 +890,7 @@ public class VeniceChangelogConsumerImplTest {
         PubSubMessageDeserializer.createDefaultDeserializer(),
         veniceChangelogConsumerClientFactory);
     veniceChangelogConsumer.setStoreRepository(mockRepository);
-    veniceChangelogConsumer.internalSeekToTimestamps(partitionTimestampMap, "").get(10, TimeUnit.SECONDS);
+    veniceChangelogConsumer.internalSeekToTimestamps(partitionTimestampMap).get(10, TimeUnit.SECONDS);
     verify(nullResponsePubSubConsumer, times(1)).endPosition(any());
     verify(nullResponsePubSubConsumer, times(1)).subscribe(any(), any(PubSubPosition.class), eq(true));
     // Verify failed seek logging
@@ -1010,7 +905,7 @@ public class VeniceChangelogConsumerImplTest {
         veniceChangelogConsumerClientFactory);
     veniceChangelogConsumer.setStoreRepository(mockRepository);
     CompletableFuture<Void> seekFuture =
-        veniceChangelogConsumer.internalSeekToTimestamps(partitionTimestampMap, "", mockLogger);
+        veniceChangelogConsumer.internalSeekToTimestamps(partitionTimestampMap, mockLogger);
     try {
       seekFuture.get(10, TimeUnit.SECONDS);
     } catch (ExecutionException e) {
@@ -1037,6 +932,9 @@ public class VeniceChangelogConsumerImplTest {
         PubSubMessageDeserializer.createDefaultDeserializer(),
         veniceChangelogConsumerClientFactory);
 
+    VeniceChangelogConsumerImpl<String, Utf8> spyConsumer = Mockito.spy(veniceChangelogConsumer);
+    doNothing().when(spyConsumer).throwIfReadsDisabled();
+
     /*
      * We make this test deterministic by making the first poll hold the lock longer than the second poll, to ensure
      * the second poll times out before it can acquire the lock. Thus, ensuring poll on the PubSubConsumer only gets
@@ -1057,7 +955,7 @@ public class VeniceChangelogConsumerImplTest {
 
     // First poll task - will acquire the lock and hold it
     Callable<Void> firstPollTask = () -> {
-      veniceChangelogConsumer.poll(pollTimeoutMs * 4); // Long timeout to ensure it gets the lock
+      spyConsumer.poll(pollTimeoutMs * 4); // Long timeout to ensure it gets the lock
       return null;
     };
 
@@ -1065,7 +963,7 @@ public class VeniceChangelogConsumerImplTest {
     Callable<Void> secondPollTask = () -> {
       // Wait for first poll to start, then try to poll with short timeout
       firstPollStarted.await();
-      veniceChangelogConsumer.poll(pollTimeoutMs / 2); // Short timeout to ensure it times out
+      spyConsumer.poll(pollTimeoutMs / 2); // Short timeout to ensure it times out
       return null;
     };
 
@@ -1082,26 +980,8 @@ public class VeniceChangelogConsumerImplTest {
 
   @Test
   public void testChangeLogConsumerSequenceId() throws ExecutionException, InterruptedException {
-    doReturn(new HashSet<>()).when(mockPubSubConsumer).getAssignment();
-    PubSubTopic newVersionTopic = pubSubTopicRepository.getTopic(Version.composeKafkaTopic(storeName, 2));
-    PubSubTopic oldVersionTopic = pubSubTopicRepository.getTopic(Version.composeKafkaTopic(storeName, 1));
-    PubSubTopic oldChangeCaptureTopic =
-        pubSubTopicRepository.getTopic(oldVersionTopic.getName() + ChangeCaptureView.CHANGE_CAPTURE_TOPIC_SUFFIX);
-    int partition = 0;
-    int partition2 = 1;
+    prepareVersionTopicRecordsToBePolled(0L, 10L, mockPubSubConsumer, oldVersionTopic, 0, true);
     long sequenceIdStartingValue = 1000L;
-    prepareChangeCaptureRecordsToBePolled(
-        0L,
-        10L,
-        mockPubSubConsumer,
-        oldChangeCaptureTopic,
-        partition,
-        oldVersionTopic,
-        newVersionTopic,
-        false,
-        false);
-    ChangelogClientConfig changelogClientConfig =
-        getChangelogClientConfig().setViewName("changeCaptureView").setIsBeforeImageView(true);
     VeniceChangelogConsumerImpl<String, Utf8> veniceChangelogConsumer = new VeniceChangelogConsumerImpl<>(
         changelogClientConfig,
         mockPubSubConsumer,
@@ -1109,10 +989,12 @@ public class VeniceChangelogConsumerImplTest {
         sequenceIdStartingValue,
         veniceChangelogConsumerClientFactory);
     veniceChangelogConsumer.setStoreRepository(mockRepository);
-    Assert.assertEquals(veniceChangelogConsumer.getPartitionCount(), 2);
-    veniceChangelogConsumer.subscribe(new HashSet<>(Collections.singletonList(partition))).get();
-    veniceChangelogConsumer.seekToBeginningOfPush().get();
-    final List<PubSubMessage<String, ChangeEvent<Utf8>, VeniceChangeCoordinate>> pubSubMessages = new ArrayList<>();
+    veniceChangelogConsumer.subscribe(Collections.singleton(0)).get();
+    when(mockPubSubConsumer.getAssignment()).thenReturn(
+        new HashSet<>(
+            veniceChangelogConsumer
+                .getPartitionListToSubscribe(Collections.singleton(0), Collections.emptySet(), oldVersionTopic)));
+    List<PubSubMessage<String, ChangeEvent<Utf8>, VeniceChangeCoordinate>> pubSubMessages = new ArrayList<>();
     TestUtils.waitForNonDeterministicAssertion(10, TimeUnit.SECONDS, () -> {
       pubSubMessages.addAll(veniceChangelogConsumer.poll(pollTimeoutMs));
       Assert.assertEquals(pubSubMessages.size(), 10);
@@ -1120,9 +1002,7 @@ public class VeniceChangelogConsumerImplTest {
     long expectedSequenceId = sequenceIdStartingValue + 1;
     for (int i = 0; i < 10; i++) {
       PubSubMessage<String, ChangeEvent<Utf8>, VeniceChangeCoordinate> pubSubMessage = pubSubMessages.get(i);
-      ChangeEvent<Utf8> changeEvent = pubSubMessage.getValue();
-      Assert.assertEquals(changeEvent.getCurrentValue().toString(), "newValue" + i);
-      Assert.assertEquals(changeEvent.getPreviousValue().toString(), "oldValue" + i);
+      Assert.assertEquals(pubSubMessage.getValue().getCurrentValue().toString(), "newValue" + i);
       Assert.assertEquals(pubSubMessage.getPosition().getConsumerSequenceId(), expectedSequenceId++);
     }
   }
@@ -1140,6 +1020,7 @@ public class VeniceChangelogConsumerImplTest {
     when(delayedMockRepository.getValueSchema(storeName, 1)).thenReturn(new SchemaEntry(1, valueSchema));
     when(store.getVersionOrThrow(Mockito.anyInt())).thenReturn(mockVersion);
     when(store.getVersion(Mockito.anyInt())).thenReturn(mockVersion);
+    when(store.isEnableReads()).thenReturn(true);
 
     CountDownLatch subscribeStarted = new CountDownLatch(1);
 
@@ -1182,64 +1063,164 @@ public class VeniceChangelogConsumerImplTest {
     verify(veniceChangelogConsumer, atLeastOnce()).getVersionCompressor(any(PubSubTopic.class));
   }
 
-  private void prepareChangeCaptureRecordsToBePolled(
-      long startIdx,
-      long endIdx,
-      PubSubConsumerAdapter pubSubConsumer,
-      PubSubTopic changeCaptureTopic,
-      int partition,
-      PubSubTopic oldVersionTopic,
-      PubSubTopic newVersionTopic,
-      boolean addEndOfPushMessage,
-      boolean repeatMessages) {
-    List<DefaultPubSubMessage> pubSubMessageList = new ArrayList<>();
+  @Test
+  public void testVersionSwapByControlMessage() throws ExecutionException, InterruptedException, TimeoutException {
+    ChangelogClientConfig versionSwapConfig = getChangelogClientConfig().setVersionSwapByControlMessageEnabled(true);
+    // Should fail without providing client region name and total region count.
+    Assert.assertThrows(
+        VeniceException.class,
+        () -> new VeniceAfterImageConsumerImpl<>(
+            versionSwapConfig,
+            mockPubSubConsumer,
+            PubSubMessageDeserializer.createDefaultDeserializer(),
+            veniceChangelogConsumerClientFactory));
 
-    // Add a start of push message
-    pubSubMessageList.add(constructStartOfPushMessage(oldVersionTopic, partition));
+    PubSubTopic newVersionTopic = pubSubTopicRepository.getTopic(Version.composeKafkaTopic(storeName, 2));
+    PubSubTopic oldVersionTopic = pubSubTopicRepository.getTopic(Version.composeKafkaTopic(storeName, 1));
+    String clientRegion = "region1";
+    String remoteRegion = "region2";
+    versionSwapConfig.setClientRegionName(clientRegion).setTotalRegionCount(2);
+    PubSubConsumerAdapter mockInternalSeekConsumer = Mockito.mock(PubSubConsumerAdapter.class);
+    Map<PubSubTopicPartition, List<DefaultPubSubMessage>> newVersionPubSubMessagesMap = new HashMap<>();
+    PubSubTopicPartition newTopicPartition1 = new PubSubTopicPartitionImpl(newVersionTopic, 1);
+    newVersionPubSubMessagesMap.put(
+        newTopicPartition1,
+        Collections.singletonList(
+            constructVersionSwapMessage(
+                newVersionTopic,
+                oldVersionTopic.getName(),
+                newVersionTopic.getName(),
+                clientRegion,
+                clientRegion,
+                2L,
+                1,
+                Collections.emptyList())));
+    when(mockInternalSeekConsumer.poll(anyLong())).thenThrow(new VeniceException("Test exception"))
+        .thenReturn(newVersionPubSubMessagesMap);
+    VeniceAfterImageConsumerImpl<String, Utf8> veniceChangeLogConsumer = new VeniceAfterImageConsumerImpl<>(
+        versionSwapConfig,
+        mockPubSubConsumer,
+        Lazy.of(() -> mockInternalSeekConsumer),
+        PubSubMessageDeserializer.createDefaultDeserializer(),
+        veniceChangelogConsumerClientFactory);
+    NativeMetadataRepositoryViewAdapter mockRepository = mock(NativeMetadataRepositoryViewAdapter.class);
+    Store store = mock(Store.class);
+    Version mockOldVersion = new VersionImpl(storeName, 1, "foo");
+    Version mockNewVersion = new VersionImpl(storeName, 2, "foo");
+    mockOldVersion.setPartitionCount(2);
+    mockNewVersion.setPartitionCount(2);
+    mockOldVersion.setCompressionStrategy(CompressionStrategy.NO_OP);
+    mockNewVersion.setCompressionStrategy(CompressionStrategy.NO_OP);
+    when(store.getCurrentVersion()).thenReturn(2);
+    when(store.getCompressionStrategy()).thenReturn(CompressionStrategy.NO_OP);
+    when(store.getPartitionCount()).thenReturn(2);
+    when(mockRepository.getStore(storeName)).thenReturn(store);
+    when(mockRepository.getValueSchema(storeName, 1)).thenReturn(new SchemaEntry(1, valueSchema));
+    when(store.getVersionOrThrow(1)).thenReturn(mockOldVersion);
+    when(store.getVersion(1)).thenReturn(mockOldVersion);
+    when(store.getVersionOrThrow(2)).thenReturn(mockNewVersion);
+    when(store.getVersion(2)).thenReturn(mockNewVersion);
+    when(store.isEnableReads()).thenReturn(true);
+    veniceChangeLogConsumer.setStoreRepository(mockRepository);
 
+    // partition 0 has an irrelevant version swap and partition 1 has a relevant version swap
     Map<PubSubTopicPartition, List<DefaultPubSubMessage>> pubSubMessagesMap = new HashMap<>();
-    for (long i = startIdx; i < endIdx; i++) {
-      DefaultPubSubMessage pubSubMessage = constructChangeCaptureConsumerRecord(
-          changeCaptureTopic,
-          partition,
-          "oldValue" + i,
-          "newValue" + i,
-          "key" + i,
-          Arrays.asList(i, i));
-      pubSubMessageList.add(pubSubMessage);
-    }
+    PubSubTopicPartition topicPartition0 = new PubSubTopicPartitionImpl(oldVersionTopic, 0);
+    pubSubMessagesMap.put(
+        topicPartition0,
+        Collections.singletonList(
+            constructVersionSwapMessage(
+                oldVersionTopic,
+                oldVersionTopic.getName(),
+                newVersionTopic.getName(),
+                remoteRegion,
+                clientRegion,
+                1L,
+                0,
+                Collections.emptyList())));
+    PubSubTopicPartition topicPartition1 = new PubSubTopicPartitionImpl(oldVersionTopic, 1);
+    pubSubMessagesMap.put(
+        topicPartition1,
+        Collections.singletonList(
+            constructVersionSwapMessage(
+                oldVersionTopic,
+                oldVersionTopic.getName(),
+                newVersionTopic.getName(),
+                clientRegion,
+                clientRegion,
+                2L,
+                1,
+                Collections.emptyList())));
+    doReturn(pubSubMessagesMap).when(mockPubSubConsumer).poll(pollTimeoutMs);
+    Set<PubSubTopicPartition> currentAssignment = new HashSet<>();
+    currentAssignment.add(topicPartition0);
+    currentAssignment.add(topicPartition1);
+    doReturn(currentAssignment).when(mockPubSubConsumer).getAssignment();
 
-    if (repeatMessages) {
-      for (long i = startIdx; i < endIdx; i++) {
-        DefaultPubSubMessage pubSubMessage = constructChangeCaptureConsumerRecord(
-            changeCaptureTopic,
-            partition,
-            "oldValue" + i,
-            "newValue" + i,
-            "key" + i,
-            Arrays.asList(i, i));
-        pubSubMessageList.add(pubSubMessage);
-      }
+    veniceChangeLogConsumer.poll(pollTimeoutMs);
+    VersionSwapMessageState versionSwapMessageState = veniceChangeLogConsumer.getVersionSwapMessageState();
+    Assert.assertNotNull(versionSwapMessageState);
+    Assert.assertEquals(versionSwapMessageState.getVersionSwapGenerationId(), 2L);
+    Assert.assertEquals(versionSwapMessageState.getOldVersionTopic(), oldVersionTopic.getName());
+    Assert.assertEquals(versionSwapMessageState.getNewVersionTopic(), newVersionTopic.getName());
+    Assert.assertFalse(versionSwapMessageState.isVersionSwapMessagesReceivedForAllPartitions());
+    Assert.assertEquals(versionSwapMessageState.getAssignedPartitions().size(), 2);
+    Assert.assertEquals(versionSwapMessageState.getIncompletePartitions().size(), 2);
+    Assert.assertNull(versionSwapMessageState.getVersionSwapLowWatermarkPosition(oldVersionTopic.getName(), 0));
+    Assert.assertNotNull(versionSwapMessageState.getVersionSwapLowWatermarkPosition(oldVersionTopic.getName(), 1));
+    PubSubPosition partition1LowWatermark =
+        versionSwapMessageState.getVersionSwapLowWatermarkPosition(oldVersionTopic.getName(), 1);
+    prepareVersionTopicRecordsToBePolled(0L, 5L, mockPubSubConsumer, oldVersionTopic, 1, false, true);
+    Collection<PubSubMessage<String, ChangeEvent<Utf8>, VeniceChangeCoordinate>> pubSubMessages =
+        veniceChangeLogConsumer.poll(pollTimeoutMs);
+    for (PubSubMessage<String, ChangeEvent<Utf8>, VeniceChangeCoordinate> pubSubMessage: pubSubMessages) {
+      // VeniceChangeCoordinate should be set to version swap low watermark
+      Assert.assertEquals(pubSubMessage.getOffset().getPosition(), partition1LowWatermark);
     }
+    // New subscribe should be blocked
+    CompletableFuture<Void> subscribeDuringVersionSwapFuture =
+        veniceChangeLogConsumer.subscribe(Collections.singleton(0));
+    Assert.assertThrows(
+        TimeoutException.class,
+        () -> subscribeDuringVersionSwapFuture.get(pollTimeoutMs, TimeUnit.MILLISECONDS));
+    // We should still be able to unsubscribe
+    veniceChangeLogConsumer.unsubscribe(Collections.singleton(0));
+    Assert.assertEquals(versionSwapMessageState.getAssignedPartitions().size(), 1);
+    Assert.assertEquals(versionSwapMessageState.getIncompletePartitions().size(), 1);
 
-    if (addEndOfPushMessage) {
-      pubSubMessageList.add(constructEndOfPushMessage(changeCaptureTopic, partition, endIdx + 1));
-    }
+    // Allow version swap to complete
+    pubSubMessagesMap = new HashMap<>();
+    pubSubMessagesMap.put(
+        topicPartition1,
+        Collections.singletonList(
+            constructVersionSwapMessage(
+                oldVersionTopic,
+                oldVersionTopic.getName(),
+                newVersionTopic.getName(),
+                clientRegion,
+                remoteRegion,
+                2L,
+                1,
+                Collections.emptyList())));
+    doReturn(pubSubMessagesMap).when(mockPubSubConsumer).poll(pollTimeoutMs);
+    veniceChangeLogConsumer.poll(pollTimeoutMs);
+    Assert.assertEquals(versionSwapMessageState.getIncompletePartitions().size(), 0);
+    Assert.assertTrue(versionSwapMessageState.isVersionSwapMessagesReceivedForAllPartitions());
 
-    ByteBuffer localHighWatermarkPubSubPosition = ApacheKafkaOffsetPosition.of(endIdx).toWireFormatBuffer();
-
-    if (newVersionTopic != null) {
-      pubSubMessageList.add(
-          constructVersionSwapMessage(
-              oldVersionTopic,
-              oldVersionTopic,
-              newVersionTopic,
-              partition,
-              Arrays.asList(localHighWatermarkPubSubPosition, localHighWatermarkPubSubPosition)));
-    }
-    PubSubTopicPartition topicPartition = new PubSubTopicPartitionImpl(changeCaptureTopic, partition);
-    pubSubMessagesMap.put(topicPartition, pubSubMessageList);
-    doReturn(pubSubMessagesMap).when(pubSubConsumer).poll(Mockito.anyLong());
+    prepareVersionTopicRecordsToBePolled(5L, 10L, mockPubSubConsumer, newVersionTopic, 1, false, true);
+    // First poll should not swap since we configured the internal consumer to fail on first attempt
+    Assert.assertTrue(veniceChangeLogConsumer.poll(pollTimeoutMs).isEmpty());
+    verify(mockPubSubConsumer, never()).subscribe(any(PubSubTopicPartition.class), any(PubSubPosition.class), eq(true));
+    // Next few polls should swap
+    TestUtils.waitForNonDeterministicAssertion(
+        5,
+        TimeUnit.SECONDS,
+        () -> Assert.assertFalse(veniceChangeLogConsumer.poll(pollTimeoutMs).isEmpty()));
+    ArgumentCaptor<PubSubTopicPartition> pubSubTopicCaptor = ArgumentCaptor.forClass(PubSubTopicPartition.class);
+    verify(mockPubSubConsumer, times(1)).subscribe(pubSubTopicCaptor.capture(), any(PubSubPosition.class), eq(true));
+    Assert.assertEquals(pubSubTopicCaptor.getValue().getTopicName(), newVersionTopic.getName());
+    // The subscribe future during version swap should also complete now
+    subscribeDuringVersionSwapFuture.get(pollTimeoutMs, TimeUnit.MILLISECONDS);
   }
 
   private void prepareVersionTopicRecordsToBePolled(
@@ -1249,11 +1230,40 @@ public class VeniceChangelogConsumerImplTest {
       PubSubTopic versionTopic,
       int partition,
       boolean prepareEndOfPush) {
+    prepareVersionTopicRecordsToBePolled(
+        startIdx,
+        endIdx,
+        pubSubConsumerAdapter,
+        versionTopic,
+        partition,
+        prepareEndOfPush,
+        false);
+  }
+
+  private void prepareVersionTopicRecordsToBePolled(
+      long startIdx,
+      long endIdx,
+      PubSubConsumerAdapter pubSubConsumerAdapter,
+      PubSubTopic versionTopic,
+      int partition,
+      boolean prepareEndOfPush,
+      boolean indexPosition) {
     List<DefaultPubSubMessage> consumerRecordList = new ArrayList<>();
     Map<PubSubTopicPartition, List<DefaultPubSubMessage>> consumerRecordsMap = new HashMap<>();
     for (long i = startIdx; i < endIdx; i++) {
-      DefaultPubSubMessage pubSubMessage =
-          constructConsumerRecord(versionTopic, partition, "newValue" + i, "key" + i, Arrays.asList(i, i));
+      PubSubPosition pubSubPosition;
+      if (indexPosition) {
+        pubSubPosition = ApacheKafkaOffsetPosition.of(i);
+      } else {
+        pubSubPosition = mockPubSubPosition;
+      }
+      DefaultPubSubMessage pubSubMessage = constructConsumerRecord(
+          versionTopic,
+          partition,
+          "newValue" + i,
+          "key" + i,
+          Arrays.asList(i, i),
+          pubSubPosition);
       consumerRecordList.add(pubSubMessage);
     }
 
@@ -1267,15 +1277,21 @@ public class VeniceChangelogConsumerImplTest {
 
   private DefaultPubSubMessage constructVersionSwapMessage(
       PubSubTopic versionTopic,
-      PubSubTopic oldTopic,
-      PubSubTopic newTopic,
+      String oldTopic,
+      String newTopic,
+      String sourceRegion,
+      String destinationRegion,
+      long generationId,
       int partition,
       List<ByteBuffer> localHighWatermarkPubSubPositions) {
     KafkaKey kafkaKey = new KafkaKey(MessageType.CONTROL_MESSAGE, new byte[0]);
     VersionSwap versionSwapMessage = new VersionSwap();
-    versionSwapMessage.oldServingVersionTopic = oldTopic.getName();
-    versionSwapMessage.newServingVersionTopic = newTopic.getName();
+    versionSwapMessage.oldServingVersionTopic = oldTopic;
+    versionSwapMessage.newServingVersionTopic = newTopic;
     versionSwapMessage.localHighWatermarkPubSubPositions = localHighWatermarkPubSubPositions;
+    versionSwapMessage.sourceRegion = sourceRegion;
+    versionSwapMessage.destinationRegion = destinationRegion;
+    versionSwapMessage.generationId = generationId;
 
     KafkaMessageEnvelope kafkaMessageEnvelope = new KafkaMessageEnvelope();
     ProducerMetadata producerMetadata = new ProducerMetadata();
@@ -1289,46 +1305,13 @@ public class VeniceChangelogConsumerImplTest {
     return new ImmutablePubSubMessage(kafkaKey, kafkaMessageEnvelope, pubSubTopicPartition, mockPubSubPosition, 0, 0);
   }
 
-  private DefaultPubSubMessage constructChangeCaptureConsumerRecord(
-      PubSubTopic changeCaptureVersionTopic,
-      int partition,
-      String oldValue,
-      String newValue,
-      String key,
-      List<Long> replicationCheckpointVector) {
-    ValueBytes oldValueBytes = new ValueBytes();
-    oldValueBytes.schemaId = 1;
-    oldValueBytes.value = ByteBuffer.wrap(valueSerializer.serialize(oldValue));
-    ValueBytes newValueBytes = new ValueBytes();
-    newValueBytes.schemaId = 1;
-    newValueBytes.value = ByteBuffer.wrap(valueSerializer.serialize(newValue));
-    RecordChangeEvent recordChangeEvent = new RecordChangeEvent();
-    recordChangeEvent.currentValue = newValueBytes;
-    recordChangeEvent.previousValue = oldValueBytes;
-    recordChangeEvent.key = ByteBuffer.wrap(key.getBytes());
-    recordChangeEvent.replicationCheckpointVector = replicationCheckpointVector;
-    final RecordSerializer<RecordChangeEvent> recordChangeSerializer = FastSerializerDeserializerFactory
-        .getFastAvroGenericSerializer(AvroProtocolDefinition.RECORD_CHANGE_EVENT.getCurrentProtocolVersionSchema());
-    recordChangeSerializer.serialize(recordChangeEvent);
-    ProducerMetadata producerMetadata = new ProducerMetadata();
-    producerMetadata.setMessageTimestamp(1000L);
-    KafkaMessageEnvelope kafkaMessageEnvelope = new KafkaMessageEnvelope(
-        MessageType.PUT.getValue(),
-        producerMetadata,
-        new Put(ByteBuffer.wrap(recordChangeSerializer.serialize(recordChangeEvent)), 1, 0, ByteBuffer.allocate(0)),
-        null);
-    kafkaMessageEnvelope.setProducerMetadata(producerMetadata);
-    KafkaKey kafkaKey = new KafkaKey(MessageType.PUT, keySerializer.serialize(key));
-    PubSubTopicPartition pubSubTopicPartition = new PubSubTopicPartitionImpl(changeCaptureVersionTopic, partition);
-    return new ImmutablePubSubMessage(kafkaKey, kafkaMessageEnvelope, pubSubTopicPartition, mockPubSubPosition, 0, 0);
-  }
-
   private DefaultPubSubMessage constructConsumerRecord(
       PubSubTopic changeCaptureVersionTopic,
       int partition,
       String newValue,
       String key,
-      List<Long> replicationCheckpointVector) {
+      List<Long> replicationCheckpointVector,
+      PubSubPosition pubSubPosition) {
     final GenericRecord rmdRecord = new GenericData.Record(rmdSchema);
     rmdRecord.put(RmdConstants.TIMESTAMP_FIELD_NAME, 0L);
     rmdRecord.put(RmdConstants.REPLICATION_CHECKPOINT_VECTOR_FIELD_NAME, replicationCheckpointVector);
@@ -1343,7 +1326,7 @@ public class VeniceChangelogConsumerImplTest {
         null);
     KafkaKey kafkaKey = new KafkaKey(MessageType.PUT, keySerializer.serialize(key));
     PubSubTopicPartition pubSubTopicPartition = new PubSubTopicPartitionImpl(changeCaptureVersionTopic, partition);
-    return new ImmutablePubSubMessage(kafkaKey, kafkaMessageEnvelope, pubSubTopicPartition, mockPubSubPosition, 0, 0);
+    return new ImmutablePubSubMessage(kafkaKey, kafkaMessageEnvelope, pubSubTopicPartition, pubSubPosition, 0, 0);
   }
 
   private DefaultPubSubMessage constructEndOfPushMessage(PubSubTopic versionTopic, int partition, Long offset) {
@@ -1362,20 +1345,27 @@ public class VeniceChangelogConsumerImplTest {
     return new ImmutablePubSubMessage(kafkaKey, kafkaMessageEnvelope, pubSubTopicPartition, mockPubSubPosition, 0, 0);
   }
 
-  private DefaultPubSubMessage constructStartOfPushMessage(PubSubTopic versionTopic, int partition) {
-    KafkaKey kafkaKey = new KafkaKey(MessageType.CONTROL_MESSAGE, new byte[0]);
-    StartOfPush startOfPush = new StartOfPush();
-    startOfPush.compressionStrategy = CompressionStrategy.NO_OP.getValue();
-    KafkaMessageEnvelope kafkaMessageEnvelope = new KafkaMessageEnvelope();
-    ProducerMetadata producerMetadata = new ProducerMetadata();
-    producerMetadata.setMessageTimestamp(1000L);
-    kafkaMessageEnvelope.setProducerMetadata(producerMetadata);
-    ControlMessage controlMessage = new ControlMessage();
-    controlMessage.controlMessageUnion = startOfPush;
-    controlMessage.controlMessageType = ControlMessageType.START_OF_PUSH.getValue();
-    kafkaMessageEnvelope.payloadUnion = controlMessage;
-    PubSubTopicPartition pubSubTopicPartition = new PubSubTopicPartitionImpl(versionTopic, partition);
-    return new ImmutablePubSubMessage(kafkaKey, kafkaMessageEnvelope, pubSubTopicPartition, mockPubSubPosition, 0, 0);
+  @Test
+  public void testSwitchToNewTopic() {
+    VeniceAfterImageConsumerImpl<String, Utf8> veniceChangelogConsumer = new VeniceAfterImageConsumerImpl<>(
+        changelogClientConfig,
+        mockPubSubConsumer,
+        PubSubMessageDeserializer.createDefaultDeserializer(),
+        veniceChangelogConsumerClientFactory);
+    veniceChangelogConsumer.setStoreRepository(mockRepository);
+
+    // Mock the consumer assignment to include the old version topic partition 0
+    PubSubTopicPartition subscribedPartition = new PubSubTopicPartitionImpl(oldVersionTopic, 0);
+    doReturn(Collections.synchronizedSet(new HashSet<>(Collections.singleton(subscribedPartition))))
+        .when(mockPubSubConsumer)
+        .getAssignment();
+
+    // switchToNewTopic with the same topic should return false (no-op)
+    assertFalse(veniceChangelogConsumer.switchToNewTopic(subscribedPartition));
+
+    // switchToNewTopic with a different topic on the same partition should return true
+    PubSubTopic newVersionTopic = pubSubTopicRepository.getTopic(Version.composeKafkaTopic(storeName, 2));
+    assertTrue(veniceChangelogConsumer.switchToNewTopic(new PubSubTopicPartitionImpl(newVersionTopic, 0)));
   }
 
   private ChangelogClientConfig getChangelogClientConfig() {
